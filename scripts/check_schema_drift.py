@@ -68,10 +68,11 @@ def py_type_to_schema(annotation: ast.expr | None) -> str:
 
     Complex / catch-all
     -------------------
-    list[...], dict[...], Any, and unknown annotations all map to
-    "string".  tools_schema.json intentionally simplifies nested and
-    collection types to "string" — it conveys structural constraints
-    through descriptions rather than JSON Schema keywords.
+    list[...] -> "array", dict[...] -> "object", Any and unknown -> "string".
+    tools_schema.json historically used "string" as a catch-all for
+    collection types; the comparison step tolerates a schema "string"
+    against a Python array/object so legacy entries don't drift. New
+    params should use precise types ("array"/"object").
 
     Union types (``str | None``, ``list[str] | None``) resolve to the
     non-None arm's type.
@@ -92,8 +93,20 @@ def py_type_to_schema(annotation: ast.expr | None) -> str:
     if isinstance(annotation, ast.Constant):
         return "string"
 
-    # Subscript: list[str], dict[str, Any], list[dict[...]], ...
+    # Subscript: list[...] -> "array", dict[...] -> "object", else "string"
     if isinstance(annotation, ast.Subscript):
+        val = annotation.value
+        if isinstance(val, ast.Name):
+            name = val.id
+        elif isinstance(val, ast.Attribute):
+            name = val.attr
+        else:
+            name = None
+        if name in ("list", "List", "Sequence", "tuple", "Tuple",
+                    "set", "Set", "frozenset", "Iterable"):
+            return "array"
+        if name in ("dict", "Dict", "Mapping", "OrderedDict"):
+            return "object"
         return "string"
 
     # BinOp (``|`` union): str | None, list[str] | None, int | float, ...
@@ -487,7 +500,11 @@ def _compare_params(
         st = schema_props[p].get("type", "string")
         ct = code_params[p].get("type", "string")
 
-        if st != ct:
+        # A schema "string" is the legacy catch-all for complex types
+        # (list/dict/Any); tolerate it against a Python "array"/"object"
+        # so legacy schema entries don't drift. Primitive mismatches
+        # (e.g. schema "string" vs Python "integer") are still real drift.
+        if st != ct and not (st == "string" and ct in ("array", "object")):
             errors.append(
                 f"  {prefix}: parameter '{p}' type mismatch: "
                 f"expected '{st}' (schema), got '{ct}' ({code_label})"
