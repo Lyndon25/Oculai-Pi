@@ -577,7 +577,7 @@ export const OCULAI_TOOLS: Record<
 
   // Web Search, Outreach & Browser
   oculai_search_web: {
-    description: "Search the web for candidate-related content via Exa or Tavily.",
+    description: "Search the web for candidate-related content via Exa, Tavily, or Firecrawl.",
     parameters: {
       type: "object",
       properties: {
