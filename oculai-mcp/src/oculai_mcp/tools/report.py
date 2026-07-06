@@ -1286,7 +1286,7 @@ def _candidate_card(idx: int, c: dict[str, Any], role_type: str = "default") -> 
                 '<div class="dim-item">'
                 '<div class="dim-item-header">'
                 f'<span class="dim-name">{_esc(dim_name)}{conf_note}</span>'
-                f'<span class="dim-score" style="color:var(--{fill_tier.replace('bar-', '')})">{sc:.1f}</span>'
+                f'<span class="dim-score" style="color:var(--{fill_tier.replace("bar-", "")})">{sc:.1f}</span>'
                 '</div>'
                 '<div class="dim-track">'
                 f'<div class="dim-fill {dim_fill_class}" style="width:{min(sc*10,100):.0f}%"></div>'
@@ -1361,7 +1361,7 @@ def _candidate_card(idx: int, c: dict[str, Any], role_type: str = "default") -> 
 
     # -- Right: Donut chart --
     lines.append(f'<div class="candidate-right">')
-    lines.append(f'<div class="donut-chart donut-{score_tier.replace('score-', '')}">')
+    lines.append(f'<div class="donut-chart donut-{score_tier.replace("score-", "")}">')
     lines.append('<svg viewBox="0 0 100 100" width="90" height="90">')
     lines.append('<circle class="donut-bg" cx="50" cy="50" r="40"/>')
     lines.append(

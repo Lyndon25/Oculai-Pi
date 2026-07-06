@@ -1,0 +1,3 @@
+# Git LFS — track the large Pi runtime binary (~121MB).
+# All other pi-windows-x64/ companion files are small (<2MB) and use regular git objects.
+pi-windows-x64/pi.exe filter=lfs merge=lfs -text

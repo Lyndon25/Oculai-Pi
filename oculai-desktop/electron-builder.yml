@@ -40,5 +40,5 @@ nsis:
 publish:
   - provider: github
     owner: Lyndon25
-    repo: Oculai
+    repo: Oculai-Pi
     releaseType: draft

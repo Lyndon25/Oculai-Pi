@@ -502,11 +502,11 @@ async def test_error_classes():
 
 
 async def test_tool_registry():
-    """Test that TOOL_REGISTRY has all 41 tools with callable handlers."""
+    """Test that TOOL_REGISTRY has all 42 tools with callable handlers."""
     from oculai_mcp.tool_registry import TOOL_REGISTRY, get_tool, list_tools
 
     tools = list_tools()
-    assert len(tools) == 41, f"Expected 41 tools, got {len(tools)}"
+    assert len(tools) == 42, f"Expected 42 tools, got {len(tools)}"
 
     # Spot-check key tools across all categories
     key_tools = [
@@ -515,7 +515,8 @@ async def test_tool_registry():
         "oculai_record_iteration", "oculai_get_task_iterations",
         "oculai_broadcast_discovery", "oculai_get_broadcasts",
         "oculai_list_source_capabilities", "oculai_search_source",
-        "oculai_deep_search", "oculai_get_search_progress", "oculai_crawl_site",
+        "oculai_deep_search", "oculai_get_search_progress",
+        "oculai_firecrawl_scrape", "oculai_crawl_site",
         "oculai_fetch_source_detail",
         "oculai_upsert_candidate", "oculai_upsert_candidates_batch",
         "oculai_link_identity", "oculai_list_candidates", "oculai_get_candidate",
@@ -539,7 +540,7 @@ async def test_tool_registry():
         assert callable(handler), f"Handler for {name} should be callable"
 
     # Verify counts by category
-    assert len(tools) == 41, "Should have exactly 41 tools"
+    assert len(tools) == 42, "Should have exactly 42 tools"
 
 
 # ============================================================================

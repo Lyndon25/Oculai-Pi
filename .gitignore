@@ -54,14 +54,18 @@ temp/
 # Local MCP configuration
 .mcp.json
 
+# Git LFS hooks (local only, created by `git lfs install`)
+.githooks/
+
 # Test runner scripts (development only)
 oculai-mcp/run_test_*.py
 oculai-mcp/run_pipeline.py
 oculai-mcp/mcp_call.py
 oculai-mcp/generate_report_*.py
 
-# Pi runtime binary (121MB+), tracked via LFS if needed
-pi-windows-x64/
+# Pi runtime — pi.exe tracked via Git LFS; companion files committed normally.
+# Only the runtime's own node_modules/ stays ignored (regenerable, not needed at runtime).
+pi-windows-x64/node_modules/
 
 # Desktop app — dependencies and build artifacts (not committed)
 oculai-desktop/node_modules/
