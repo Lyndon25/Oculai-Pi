@@ -184,8 +184,11 @@
             "description": "The URL to scrape"
           },
           "formats": {
-            "type": "string",
-            "description": "Output formats (\"markdown\" default, \"html\", \"screenshot\")",
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Output formats: [\"markdown\"] (default), [\"html\"], [\"screenshot\"], etc.",
             "default": null
           },
           "wait_for": {

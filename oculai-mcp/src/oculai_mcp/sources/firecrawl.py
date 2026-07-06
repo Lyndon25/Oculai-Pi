@@ -9,73 +9,15 @@ For Python access, get a free API key at https://firecrawl.dev/app/api-keys
 """
 
 import logging
-import re
 import time
-from typing import Any
 
-import httpx
-
-from oculai_mcp.config import get_settings
 from oculai_mcp.db.provenance import log_source_call
 from oculai_mcp.db.quotas import check_quota, try_consume_quota
 from oculai_mcp.sources.base import HealthStatus, IDataSource, RawCandidate, SearchQuery
+from oculai_mcp.tools import firecrawl_client
+from oculai_mcp.utils.name_extract import extract_person_name_from_title
 
 logger = logging.getLogger(__name__)
-
-FIRECRAWL_API_BASE = "https://api.firecrawl.dev/v1"
-
-# ---------------------------------------------------------------------------
-# Person-name extraction helpers (shared pattern with DuckDuckGo source)
-# ---------------------------------------------------------------------------
-
-_NAME_SEPARATOR_RE = re.compile(r"^(.{1,60}?)\s+[|·-]\s+")
-_CHINESE_NAME_RE = re.compile(r"^[一-鿿]{2,4}")
-_AUTHOR_PREFIX_RE = re.compile(r"(?:作者|by|writer)[:\s]*(.{2,30})", re.I)
-
-
-def _extract_person_name_from_title(title: str, snippet: str) -> str | None:
-    """Try to extract a person's name from a search result title/snippet."""
-    if not title:
-        return None
-
-    title = title.strip()
-
-    # Pattern 1: name before separator (e.g., "张三 - 个人主页", "John Doe | LinkedIn")
-    m = _NAME_SEPARATOR_RE.match(title)
-    if m:
-        candidate = m.group(1).strip()
-        if _is_likely_person_name(candidate):
-            return candidate
-
-    # Pattern 2: Chinese name at the very start (2-4 hanzi)
-    m = _CHINESE_NAME_RE.match(title)
-    if m:
-        return m.group(0)
-
-    # Pattern 3: "作者：xxx" or "by xxx" in snippet
-    if snippet:
-        m = _AUTHOR_PREFIX_RE.search(snippet)
-        if m:
-            candidate = m.group(1).strip()
-            if _is_likely_person_name(candidate):
-                return candidate
-
-    return None
-
-
-def _is_likely_person_name(text: str) -> bool:
-    """Quick heuristic: does this look like a person name?"""
-    if not text or len(text) < 2 or len(text) > 30:
-        return False
-    if any(c in text for c in "《》「」『』"):
-        return False
-    if re.search(r"[:：].{3,}", text):
-        return False
-    if not re.search(r"[a-zA-Z一-鿿]", text):
-        return False
-    if text.isdigit():
-        return False
-    return True
 
 
 class FirecrawlSource(IDataSource):
@@ -113,98 +55,70 @@ class FirecrawlSource(IDataSource):
     )
 
     async def search(self, query: SearchQuery) -> list[RawCandidate]:
-        """Search Firecrawl web for candidate mentions."""
+        """Search Firecrawl web for candidate mentions.
+
+        Never raises: on quota exhaustion or any Firecrawl failure (keyless
+        403, HTTP error, ``success=False``) it logs a single provenance row
+        and returns an empty list, consistent with sibling sources (F1/F2).
+        """
         start = time.monotonic()
 
+        # Quota exhaustion: bail out early (return [], never raise), matching
+        # the sibling sources (duckduckgo, baidu, ...). Logged once here,
+        # outside the try, so the broad except cannot double-log it.
         if not await check_quota(self.name):
-            msg = f"Firecrawl quota exceeded for {self.name}"
             await log_source_call(
                 source_name=self.name,
                 source_type=self.source_type,
                 query_params={"keywords": query.keywords},
                 status="rate_limited",
                 duration_ms=0,
-                error_message=msg,
             )
-            raise RuntimeError(msg)
-
-        settings = get_settings()
-        api_key = getattr(settings, "firecrawl_api_key", None)
+            return []
 
         candidates: list[RawCandidate] = []
         try:
             keywords = " ".join(query.keywords)
             max_results = min(query.limit, 20)
 
-            async with httpx.AsyncClient(
-                timeout=30.0,
-                headers={"User-Agent": "Oculai/1.0 (+https://github.com/oculai)"},
-            ) as client:
-                headers: dict[str, str] = {"Content-Type": "application/json"}
-                if api_key:
-                    headers["Authorization"] = f"Bearer {api_key}"
+            # The shared client raises FirecrawlKeylessBlockedError (keyless
+            # 403), FirecrawlApiError (success=False), or httpx.HTTPStatusError
+            # on other HTTP failures. The broad except below logs a single
+            # 'failed' provenance row and returns [] — search() never raises
+            # and never double-logs (F1/F2).
+            results = await firecrawl_client.search(query=keywords, limit=max_results)
 
-                body: dict[str, Any] = {"query": keywords, "limit": max_results}
+            for r in results[:max_results]:
+                title = r.get("title", "")
+                url = r.get("url", "")
+                snippet = r.get("description", "")
 
-                resp = await client.post(
-                    f"{FIRECRAWL_API_BASE}/search", json=body, headers=headers
+                name = extract_person_name_from_title(title, snippet)
+                if name:
+                    result_type = "profile_page"
+                    confidence = "medium"
+                    extraction_method = "inferred"
+                else:
+                    name = "Unknown"
+                    result_type = "web_page"
+                    confidence = "low"
+                    extraction_method = "unverified"
+
+                candidates.append(
+                    RawCandidate(
+                        name=name,
+                        profile_url=url or None,
+                        raw_metadata={
+                            "source": "firecrawl",
+                            "title": title,
+                            "snippet": snippet,
+                            "url": url,
+                        },
+                        result_type=result_type,
+                        confidence=confidence,
+                        extraction_method=extraction_method,
+                    )
                 )
-
-                if resp.status_code == 403 and not api_key:
-                    msg = (
-                        "Firecrawl keyless blocked from Python (TLS fingerprint). "
-                        "Get a free API key at https://firecrawl.dev/app/api-keys"
-                    )
-                    logger.warning(msg)
-                    await log_source_call(
-                        source_name=self.name,
-                        source_type=self.source_type,
-                        query_params={"keywords": query.keywords},
-                        status="failed",
-                        duration_ms=int((time.monotonic() - start) * 1000),
-                        error_message=msg,
-                    )
-                    raise RuntimeError(msg)
-
-                resp.raise_for_status()
-                data = resp.json()
-
-                if not data.get("success"):
-                    raise RuntimeError(
-                        data.get("error", "Firecrawl search returned unsuccessful response")
-                    )
-
-                for r in data.get("data", [])[:max_results]:
-                    title = r.get("title", "")
-                    url = r.get("url", "")
-                    snippet = r.get("description", "")
-
-                    name = _extract_person_name_from_title(title, snippet)
-                    if name:
-                        result_type = "profile_page"
-                        confidence = "medium"
-                        extraction_method = "inferred"
-                    else:
-                        name = "Unknown"
-                        result_type = "web_page"
-                        confidence = "low"
-                        extraction_method = "unverified"
-
-                    candidates.append(
-                        RawCandidate(
-                            name=name,
-                            profile_url=url or None,
-                            raw_metadata={
-                                "source": "firecrawl",
-                                "title": title,
-                                "snippet": snippet,
-                                "url": url,
-                            },
-                            result_type=result_type,
-                            confidence=confidence,
-                            extraction_method=extraction_method,
-                        )
-                    )
 
             await try_consume_quota(self.name, amount=len(candidates))
             duration_ms = int((time.monotonic() - start) * 1000)
@@ -232,59 +146,63 @@ class FirecrawlSource(IDataSource):
         return candidates
 
     async def get_detail(self, external_id: str) -> RawCandidate | None:
-        """Scrape a profile URL via Firecrawl and extract candidate details."""
+        """Scrape a profile URL via Firecrawl and extract candidate details.
+
+        Returns ``None`` on any failure (keyless 403, HTTP error,
+        ``success=False``); the failure is logged once via provenance.
+        Confidence/extraction_method are gated on whether a real name was
+        extracted from the page title (F12): an extracted name yields
+        ``medium``/``direct``; a fallback to the raw title or ``"Unknown"``
+        yields ``low``/``unverified``.
+        """
         start = time.monotonic()
-        settings = get_settings()
-        api_key = getattr(settings, "firecrawl_api_key", None)
 
         try:
-            async with httpx.AsyncClient(
-                timeout=30.0,
-                headers={"User-Agent": "Oculai/1.0 (+https://github.com/oculai)"},
-            ) as client:
-                headers: dict[str, str] = {"Content-Type": "application/json"}
-                if api_key:
-                    headers["Authorization"] = f"Bearer {api_key}"
+            # The shared client raises on keyless 403 / success=False / HTTP
+            # errors; the except below logs once and returns None.
+            data = await firecrawl_client.scrape(
+                url=external_id, formats=["markdown"]
+            )
 
-                body = {"url": external_id, "formats": ["markdown"]}
-                resp = await client.post(
-                    f"{FIRECRAWL_API_BASE}/scrape", json=body, headers=headers
-                )
-                resp.raise_for_status()
-                data = resp.json()
+            markdown = data.get("markdown") or ""
+            metadata = data.get("metadata") or {}
+            title = metadata.get("title", "")
 
-                if not data.get("success"):
-                    return None
+            # Gate confidence/extraction_method on whether a name was actually
+            # extracted vs. falling back to the raw title / "Unknown" (F12),
+            # mirroring search()'s low/medium distinction.
+            extracted_name = extract_person_name_from_title(title, "")
+            if extracted_name:
+                name = extracted_name
+                confidence = "medium"
+                extraction_method = "direct"
+            else:
+                name = title or "Unknown"
+                confidence = "low"
+                extraction_method = "unverified"
 
-                markdown = (data.get("data") or {}).get("markdown", "")
-                metadata = (data.get("data") or {}).get("metadata", {})
-                title = metadata.get("title", "")
+            duration_ms = int((time.monotonic() - start) * 1000)
+            await log_source_call(
+                source_name=f"{self.name}_detail",
+                source_type=self.source_type,
+                query_params={"external_id": external_id},
+                status="success",
+                duration_ms=duration_ms,
+            )
 
-                # Try to extract name from title
-                name = _extract_person_name_from_title(title, "") or title or "Unknown"
-
-                duration_ms = int((time.monotonic() - start) * 1000)
-                await log_source_call(
-                    source_name=f"{self.name}_detail",
-                    source_type=self.source_type,
-                    query_params={"external_id": external_id},
-                    status="success",
-                    duration_ms=duration_ms,
-                )
-
-                return RawCandidate(
-                    name=name,
-                    profile_url=external_id,
-                    raw_metadata={
-                        "source": "firecrawl",
-                        "title": title,
-                        "markdown_preview": markdown[:500],
-                        "url": external_id,
-                    },
-                    result_type="profile_page",
-                    confidence="medium",
-                    extraction_method="direct",
-                )
+            return RawCandidate(
+                name=name,
+                profile_url=external_id,
+                raw_metadata={
+                    "source": "firecrawl",
+                    "title": title,
+                    "markdown_preview": markdown[:500],
+                    "url": external_id,
+                },
+                result_type="profile_page",
+                confidence=confidence,
+                extraction_method=extraction_method,
+            )
 
         except Exception as e:
             duration_ms = int((time.monotonic() - start) * 1000)
@@ -300,37 +218,15 @@ class FirecrawlSource(IDataSource):
             return None
 
     async def check_health(self) -> HealthStatus:
-        """Ping Firecrawl API to verify connectivity."""
-        start = time.monotonic()
-        settings = get_settings()
-        api_key = getattr(settings, "firecrawl_api_key", None)
+        """Probe Firecrawl connectivity via the shared client.
 
-        try:
-            async with httpx.AsyncClient(
-                timeout=30.0,
-                headers={"User-Agent": "Oculai/1.0 (+https://github.com/oculai)"},
-            ) as client:
-                headers: dict[str, str] = {"Content-Type": "application/json"}
-                if api_key:
-                    headers["Authorization"] = f"Bearer {api_key}"
-
-                body = {"query": "test", "limit": 1}
-                resp = await client.post(
-                    f"{FIRECRAWL_API_BASE}/search", json=body, headers=headers
-                )
-                latency_ms = int((time.monotonic() - start) * 1000)
-
-                if resp.status_code == 200:
-                    return HealthStatus(healthy=True, latency_ms=latency_ms)
-                return HealthStatus(
-                    healthy=False,
-                    latency_ms=latency_ms,
-                    error_message=f"HTTP {resp.status_code}: {resp.text[:200]}",
-                )
-        except Exception as e:
-            latency_ms = int((time.monotonic() - start) * 1000)
-            return HealthStatus(
-                healthy=False,
-                latency_ms=latency_ms,
-                error_message=str(e),
-            )
+        Keyless 403 is treated as healthy-but-keyless (keyless is a supported
+        mode, matching ``auth_required=False``); other non-200 statuses are
+        unhealthy with a descriptive message (F11).
+        """
+        healthy, latency_ms, error_message = await firecrawl_client.check_health()
+        return HealthStatus(
+            healthy=healthy,
+            latency_ms=latency_ms,
+            error_message=error_message,
+        )

@@ -13,10 +13,11 @@ import httpx
 
 from oculai_mcp.config import get_settings
 from oculai_mcp.db.provenance import log_source_call
+from oculai_mcp.tools import firecrawl_client
+from oculai_mcp.tools.firecrawl_client import FirecrawlKeylessBlockedError
 
 EXA_API_BASE = "https://api.exa.ai"
 TAVILY_API_BASE = "https://api.tavily.com"
-FIRECRAWL_API_BASE = "https://api.firecrawl.dev/v1"
 
 
 async def search_web(
@@ -78,7 +79,7 @@ async def search_web(
         elif provider == "exa":
             results = await _search_exa(api_key, query, limit, include_domains, exclude_domains)
         else:
-            results = await _search_firecrawl(api_key, query, limit, include_domains, exclude_domains)
+            results = await _search_firecrawl(query, limit, include_domains, exclude_domains)
 
         elapsed_ms = int((time.monotonic() - start) * 1000)
         await log_source_call(
@@ -189,59 +190,32 @@ async def _search_exa(
 
 
 async def _search_firecrawl(
-    api_key: str | None,
     query: str,
     limit: int,
     include_domains: list[str] | None,
     exclude_domains: list[str] | None,
 ) -> list[dict[str, Any]]:
-    """Execute a Firecrawl search. Uses keyless mode if no API key."""
-    async with httpx.AsyncClient(
-        timeout=30.0,
-        headers={"User-Agent": "Oculai/1.0 (+https://github.com/oculai)"},
-    ) as client:
-        headers: dict[str, str] = {"Content-Type": "application/json"}
-        if api_key:
-            headers["Authorization"] = f"Bearer {api_key}"
+    """Execute a Firecrawl search. Uses keyless mode if no API key.
 
-        body: dict[str, Any] = {
-            "query": query,
-            "limit": min(limit, 20),
-        }
-        if include_domains:
-            body["includeDomains"] = include_domains
-        if exclude_domains:
-            body["excludeDomains"] = exclude_domains
-
-        resp = await client.post(
-            f"{FIRECRAWL_API_BASE}/search", json=body, headers=headers
+    Delegates HTTP/auth/keyless-403 handling to ``firecrawl_client``. The shared
+    client raises ``FirecrawlKeylessBlockedError`` when keyless mode is blocked
+    from Python; we re-raise it as ``RuntimeError`` so ``search_web``'s broad
+    ``except`` wraps it as ``status: "error"`` (preserving prior behavior).
+    """
+    try:
+        results = await firecrawl_client.search(
+            query, limit, include_domains, exclude_domains
         )
-        if resp.status_code == 403 and not api_key:
-            try:
-                data = resp.json()
-                error_detail = data.get("error", "")
-            except ValueError:
-                error_detail = resp.text[:200]
-            raise RuntimeError(
-                f"Firecrawl keyless blocked (TLS fingerprint). {error_detail} "
-                "Get a free API key at https://firecrawl.dev/app/api-keys "
-                "and set FIRECRAWL_API_KEY in .env"
-            )
-        resp.raise_for_status()
-        data = resp.json()
+    except FirecrawlKeylessBlockedError as e:
+        raise RuntimeError(str(e))
 
-        if not data.get("success"):
-            raise RuntimeError(
-                data.get("error", "Firecrawl search returned unsuccessful response")
-            )
-
-        return [
-            {
-                "title": r.get("title", ""),
-                "url": r.get("url", ""),
-                "snippet": r.get("description", ""),
-                "score": r.get("score", 0),
-                "raw_metadata": {"source": "firecrawl"},
-            }
-            for r in (data.get("data") or [])[:limit]
-        ]
+    return [
+        {
+            "title": r.get("title", ""),
+            "url": r.get("url", ""),
+            "snippet": r.get("description", ""),
+            "score": r.get("score", 0),
+            "raw_metadata": {"source": "firecrawl"},
+        }
+        for r in results[:limit]
+    ]

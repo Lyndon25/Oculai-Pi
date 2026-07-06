@@ -12,7 +12,6 @@ Requirements:
 
 import asyncio
 import logging
-import re
 import time
 from typing import Any
 
@@ -22,68 +21,9 @@ from oculai_mcp.config import get_settings
 from oculai_mcp.db.provenance import log_source_call
 from oculai_mcp.db.quotas import check_quota, try_consume_quota
 from oculai_mcp.sources.base import HealthStatus, IDataSource, RawCandidate, SearchQuery
+from oculai_mcp.utils.name_extract import extract_person_name_from_title
 
 logger = logging.getLogger(__name__)
-
-# ---------------------------------------------------------------------------
-# Person-name extraction helpers for Baidu web-search results
-# ---------------------------------------------------------------------------
-
-_NAME_SEPARATOR_RE = re.compile(r"^(.{1,60}?)\s+[|·-]\s+")
-_CHINESE_NAME_RE = re.compile(r"^[一-鿿]{2,4}")
-_AUTHOR_PREFIX_RE = re.compile(r"(?:作者|by|writer)[:\s]*(.{2,30})", re.I)
-
-
-def _extract_person_name_from_title(title: str, snippet: str) -> str | None:
-    """Try to extract a person's name from a Baidu search result title/snippet.
-
-    Returns the name if a reasonable person name is found, otherwise None.
-    """
-    if not title:
-        return None
-
-    title = title.strip()
-
-    # Pattern 1: name before separator (e.g., "张三 - 百度百科", "李四 | 某大学")
-    m = _NAME_SEPARATOR_RE.match(title)
-    if m:
-        candidate = m.group(1).strip()
-        if _is_likely_person_name(candidate):
-            return candidate
-
-    # Pattern 2: Chinese name at the very start (2-4 hanzi)
-    m = _CHINESE_NAME_RE.match(title)
-    if m:
-        return m.group(0)
-
-    # Pattern 3: "作者：xxx" or "by xxx" in snippet
-    if snippet:
-        m = _AUTHOR_PREFIX_RE.search(snippet)
-        if m:
-            candidate = m.group(1).strip()
-            if _is_likely_person_name(candidate):
-                return candidate
-
-    return None
-
-
-def _is_likely_person_name(text: str) -> bool:
-    """Quick heuristic: does this look like a person name (not a title/company)?"""
-    if not text or len(text) < 2 or len(text) > 30:
-        return False
-    # Reject if it contains strong article/title markers
-    if any(c in text for c in "《》「」『』"):
-        return False
-    if re.search(r"[:：].{3,}", text):
-        return False
-    # Must have some alphabetic or CJK characters
-    if not re.search(r"[a-zA-Z一-鿿]", text):
-        return False
-    # Reject pure numbers
-    if text.isdigit():
-        return False
-    return True
-
 
 # baidusearch (no hyphen) is the actual package on PyPI.
 _BAIDU_SEARCH_AVAILABLE = False
@@ -464,7 +404,7 @@ class BaiduSearchSource(IDataSource):
                 url = r.get("url", "") if isinstance(r, dict) else ""
                 snippet = r.get("abstract", "") if isinstance(r, dict) else ""
 
-                name = _extract_person_name_from_title(title, snippet)
+                name = extract_person_name_from_title(title, snippet)
                 if name:
                     result_type = "profile_page"
                     confidence = "medium"

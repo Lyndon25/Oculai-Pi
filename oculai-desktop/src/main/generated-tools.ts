@@ -278,7 +278,7 @@ export const OCULAI_TOOLS: Record<
       type: "object",
       properties: {
         url: { type: "string" },
-        formats: { type: "string" },
+        formats: { type: "array", items: { type: "string" } },
         wait_for: { type: "integer" },
         run_id: { type: "string" }
       },

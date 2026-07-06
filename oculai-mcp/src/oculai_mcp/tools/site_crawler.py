@@ -18,8 +18,8 @@ from uuid import UUID
 
 import httpx
 
-from oculai_mcp.config import get_settings
 from oculai_mcp.db.provenance import log_source_call
+from oculai_mcp.tools import firecrawl_client
 from oculai_mcp.utils.html_denoise import html_to_fit_markdown, is_likely_dynamic_page
 
 logger = logging.getLogger(__name__)
@@ -159,81 +159,131 @@ async def crawl_site(
             "error": {"code": "invalid_url", "message": f"Invalid start URL: {start_url}"},
         }
 
-    # --- Firecrawl crawl fast path (when API key is available) ---
-    try:
-        settings = get_settings()
-        fc_key = getattr(settings, "firecrawl_api_key", None)
-        if fc_key:
-            async with httpx.AsyncClient(timeout=90.0) as client:
-                fc_headers = {
-                    "Content-Type": "application/json",
-                    "Authorization": f"Bearer {fc_key}",
-                }
-                # Start async crawl job
-                fc_body = {"url": start_url, "limit": max_pages}
-                if max_depth:
-                    fc_body["maxDepth"] = max_depth
-                fc_resp = await client.post(
-                    "https://api.firecrawl.dev/v1/crawl",
-                    json=fc_body, headers=fc_headers,
+    # --- Firecrawl crawl fast path (when an API key is available) ---
+    # Keyless mode is blocked from Python (TLS fingerprint), so the Firecrawl
+    # path is only attempted when a key is configured. On any failure, timeout,
+    # or non-complete status we fall through to the BFS path below, cancelling
+    # any orphaned Firecrawl job first.
+    if firecrawl_client.get_api_key():
+        job_id: str | None = None
+        try:
+            job_id = await firecrawl_client.start_crawl(
+                url=start_url,
+                max_pages=max_pages,
+                # F10: forward max_depth as-is (including 0, which Firecrawl
+                # treats as "homepage only"). start_crawl omits the maxDepth
+                # field only when max_depth is None, so 0 is honored instead of
+                # being swallowed by a truthy `if max_depth:` check.
+                max_depth=max_depth,
+                # F9: honor same_domain_only by toggling external links.
+                allow_external=not same_domain_only,
+            )
+            # Poll for completion with a total ~60s deadline. Each get_crawl
+            # request carries its own 30s timeout (set in firecrawl_client);
+            # this outer deadline bounds the whole fast path so a stuck
+            # 'processing' job cannot hang the crawl indefinitely.
+            deadline = time.monotonic() + 60.0
+            fallthrough_status: str | None = None
+            while time.monotonic() < deadline:
+                await asyncio.sleep(2.0)
+                poll_data = await firecrawl_client.get_crawl(job_id)
+                status = poll_data.get("status")
+                if status == "completed":
+                    fc_pages = poll_data.get("data", []) or []
+                    elapsed_ms = int((time.monotonic() - start_time) * 1000)
+                    await log_source_call(
+                        source_name="site_crawler",
+                        source_type="api",
+                        query_params={
+                            "start_url": start_url,
+                            "max_pages": max_pages,
+                        },
+                        status="success",
+                        duration_ms=elapsed_ms,
+                        run_id=run_id,
+                        records_count=len(fc_pages),
+                    )
+                    # F7: normalize to the BFS path's return shape so a consumer
+                    # reading page_contents[url] or page['depth'] works on both
+                    # paths. F3: use (p.get('metadata') or {}) for safe access
+                    # when metadata is null (mirrors the url pattern).
+                    normalized_pages: list[dict[str, Any]] = []
+                    page_contents: dict[str, str] = {}
+                    for p in fc_pages:
+                        meta = p.get("metadata") or {}
+                        page_url = meta.get("url", "") or ""
+                        title = meta.get("title", "") or ""
+                        markdown = p.get("markdown", "") or ""
+                        normalized_pages.append({
+                            "url": page_url,
+                            "depth": 0,
+                            "title": title,
+                            "markdown": markdown,
+                            "markdown_length": len(markdown),
+                            "links_found": 0,
+                            "dynamic_rendered": False,
+                        })
+                        if page_url:
+                            page_contents[page_url] = markdown
+                    combined_text = "\n\n---\n\n".join(
+                        f"# {p['title'] or 'Untitled'}\n\n{p['markdown'][:3000]}"
+                        for p in normalized_pages
+                    )
+                    return {
+                        "status": "success",
+                        "provider": "firecrawl",
+                        "start_url": start_url,
+                        "domain": base_domain,
+                        "pages_crawled": len(normalized_pages),
+                        "max_depth_reached": 0,
+                        "dynamic_pages": 0,
+                        "duration_ms": elapsed_ms,
+                        "pages": normalized_pages,
+                        "page_contents": page_contents,
+                        "combined_text": combined_text[:50000],
+                        "link_graph": {},
+                        "meta": {
+                            "total_pages": len(normalized_pages),
+                            "max_pages": max_pages,
+                            "max_depth": max_depth,
+                            "latency_ms": elapsed_ms,
+                            "crawl_engine": "firecrawl",
+                        },
+                    }
+                if status in ("failed", "cancelled"):
+                    fallthrough_status = status
+                    break
+            # Loop exited without a completed-return.
+            if fallthrough_status:
+                logger.warning(
+                    "Firecrawl crawl job %s ended with status '%s'; "
+                    "falling back to BFS",
+                    job_id, fallthrough_status,
                 )
-                if fc_resp.status_code == 200:
-                    fc_data = fc_resp.json()
-                    if fc_data.get("success") and fc_data.get("id"):
-                        job_id = fc_data["id"]
-                        # Poll for completion (max 60s)
-                        for _ in range(30):
-                            await asyncio.sleep(2.0)
-                            poll_resp = await client.get(
-                                f"https://api.firecrawl.dev/v1/crawl/{job_id}",
-                                headers=fc_headers,
-                            )
-                            if poll_resp.status_code == 200:
-                                poll_data = poll_resp.json()
-                                status = poll_data.get("status")
-                                if status == "completed":
-                                    fc_pages = poll_data.get("data", [])
-                                    elapsed_ms = int((time.monotonic() - start_time) * 1000)
-                                    await log_source_call(
-                                        source_name="site_crawler",
-                                        source_type="api",
-                                        query_params={"start_url": start_url, "max_pages": max_pages},
-                                        status="success",
-                                        duration_ms=elapsed_ms,
-                                        run_id=run_id,
-                                        records_count=len(fc_pages),
-                                    )
-                                    # Build combined_text for schema compatibility with BFS path
-                                    combined_text = "\n\n".join(p.get("markdown", "") for p in fc_pages)
-                                    return {
-                                        "status": "success",
-                                        "provider": "firecrawl",
-                                        "start_url": start_url,
-                                        "domain": base_domain,
-                                        "pages": [
-                                            {
-                                                "url": (p.get("metadata") or {}).get("url", ""),
-                                                "title": p.get("metadata", {}).get("title", ""),
-                                                "content": p.get("markdown", ""),
-                                                "fit_markdown": p.get("markdown", ""),
-                                            }
-                                            for p in fc_pages
-                                        ],
-                                        "pages_crawled": len(fc_pages),
-                                        "combined_text": combined_text[:50000],
-                                        "link_graph": {},
-                                        "meta": {
-                                            "total_pages": len(fc_pages),
-                                            "max_pages": max_pages,
-                                            "max_depth": max_depth,
-                                            "latency_ms": elapsed_ms,
-                                            "crawl_engine": "firecrawl",
-                                        },
-                                    }
-                                elif status in ("failed", "cancelled"):
-                                    break  # fall through to BFS
-    except Exception:
-        logger.warning("Firecrawl crawl path failed, falling back to BFS", exc_info=True)
+            else:
+                logger.warning(
+                    "Firecrawl crawl job %s still processing after ~60s "
+                    "deadline; falling back to BFS",
+                    job_id,
+                )
+        except Exception:
+            logger.warning(
+                "Firecrawl crawl path failed, falling back to BFS",
+                exc_info=True,
+            )
+
+        # F8: best-effort cancel of any orphaned Firecrawl job on fall-through
+        # to BFS (processing-timeout / failed / cancelled / exception). Not
+        # reached on success because the completed branch returns above.
+        # cancel_crawl never raises (it swallows its own errors); the outer
+        # try/except is belt-and-suspenders and cannot block the BFS fallback.
+        if job_id:
+            try:
+                await firecrawl_client.cancel_crawl(job_id)
+            except Exception:
+                logger.debug(
+                    "Failed to cancel Firecrawl job %s", job_id, exc_info=True
+                )
 
     # BFS queue: (url, depth)
     queue: deque[tuple[str, int]] = deque([(start_url, 0)])

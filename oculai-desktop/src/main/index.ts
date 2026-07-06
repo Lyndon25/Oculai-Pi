@@ -141,6 +141,25 @@ async function startBackend(): Promise<void> {
     // Continue without DB — user can configure later
   }
 
+  // Propagate source API keys from the settings store to process.env so the
+  // Python sidecar inherits them (tool-bridge.ts spawns with {...process.env}).
+  // Only assign when a key is non-null, so an unset key never overwrites a
+  // value already present in process.env (e.g. from the shell or .env).
+  const sourceKeyEnvMap: Array<[string, string]> = [
+    ["firecrawl", "FIRECRAWL_API_KEY"],
+    ["tavily", "TAVILY_API_KEY"],
+    ["exa", "EXA_API_KEY"],
+    ["github", "GITHUB_TOKEN"],
+    ["semantic_scholar", "SEMANTIC_SCHOLAR_API_KEY"],
+    ["baidu", "BAIDU_API_KEY"],
+  ];
+  for (const [provider, envVar] of sourceKeyEnvMap) {
+    const key = getSettingsStore().getApiKey(provider);
+    if (key) {
+      process.env[envVar] = key;
+    }
+  }
+
   // 2. Start Python sidecar
   try {
     stateBus.emitSystemStatus({
