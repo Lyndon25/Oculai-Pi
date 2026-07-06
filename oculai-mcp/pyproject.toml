@@ -20,7 +20,7 @@ baidu = ["baidu-search", "baidu-scholar-search"]
 duckduckgo = ["duckduckgo-search>=7.0"]
 
 # Development
-dev = ["pytest>=8.0", "pytest-asyncio>=0.24"]
+dev = ["pytest>=8.0", "pytest-asyncio>=0.24", "anyio>=4.0", "ruff>=0.5", "mypy>=1.10"]
 
 [build-system]
 requires = ["hatchling"]
@@ -38,3 +38,31 @@ markers = [
     "unit: Unit tests that can run without external dependencies",
     "slow: Tests that take more than 5 seconds",
 ]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+# Conservative rule set for a codebase new to linting:
+# F = pyflakes (real bugs: undefined names, unused imports); E/W = pycodestyle; I = isort.
+select = ["E", "F", "W", "I"]
+ignore = [
+    "E501",  # line too long — too noisy pre-cleanup
+    "E402",  # module-level import not at top (sys.path manipulation in tests)
+    "E722",  # bare except (common in error-handling code)
+    "E741",  # ambiguous variable name (l, I, O)
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["E", "W", "I"]  # tests: enforce only pyflakes (F)
+
+[tool.mypy]
+python_version = "3.11"
+ignore_missing_imports = true
+check_untyped_defs = false
+disallow_untyped_defs = false
+warn_return_any = false
+warn_unused_ignores = false
+no_implicit_optional = true
+show_error_codes = true
