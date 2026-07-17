@@ -134,6 +134,8 @@ export class PostgresManager {
             "-D", this.dataDir,
             "--username", this.config.user,
             "--pwfile", passwordFile,
+            "--encoding=UTF8",
+            "--locale=C",
           ],
           { shell: false, stdio: "pipe", windowsHide: true, env: this.postgresEnv() },
         );
