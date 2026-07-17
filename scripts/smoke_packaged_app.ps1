@@ -29,7 +29,13 @@ if (-not $CaseRoot.StartsWith(
 }
 New-Item -ItemType Directory -Path $CaseRoot -Force | Out-Null
 
-$Profile = Join-Path $CaseRoot "profile"
+$ProfileRoot = if ($env:RUNNER_TEMP) {
+    Join-Path $env:RUNNER_TEMP "oculai-packaged-app-smoke"
+} else {
+    $WorkRoot
+}
+New-Item -ItemType Directory -Path $ProfileRoot -Force | Out-Null
+$Profile = Join-Path $ProfileRoot ([guid]::NewGuid().ToString())
 $StdoutLog = Join-Path $CaseRoot "stdout.log"
 $StderrLog = Join-Path $CaseRoot "stderr.log"
 $RuntimeRoot = Join-Path $AppRoot "resources\runtime"
@@ -190,6 +196,10 @@ try {
     }
     Get-PackagedProcesses | ForEach-Object {
         Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
+    }
+
+    if (Test-Path -LiteralPath $Profile) {
+        Remove-Item -LiteralPath $Profile -Recurse -Force -ErrorAction SilentlyContinue
     }
 
     if ($Succeeded -and $CaseRoot.StartsWith(
