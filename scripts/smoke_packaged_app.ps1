@@ -59,6 +59,13 @@ function Get-PackagedProcesses {
 
 try {
     New-Item -ItemType Directory -Path $Profile -Force | Out-Null
+    if ($env:RUNNER_TEMP) {
+        $CurrentIdentity = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
+        & icacls $Profile /inheritance:r /grant:r "${CurrentIdentity}:(OI)(CI)F" "SYSTEM:(OI)(CI)F" | Out-Null
+        if ($LASTEXITCODE -ne 0) {
+            throw "Could not secure packaged smoke profile ACL for $CurrentIdentity"
+        }
+    }
     if ($CloseDuringStartup) {
         Remove-Item Env:OCULAI_SMOKE_EXIT_MS -ErrorAction SilentlyContinue
         $env:OCULAI_SMOKE_CLOSE_DURING_START_MS = "1000"
