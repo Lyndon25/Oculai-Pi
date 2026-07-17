@@ -46,6 +46,8 @@ async def record_search_round(
         results_count, verified_count, persisted_count,
         signal_quality, result_diversity, is_saturated, terminated_reason,
     )
+    if row is None:
+        raise RuntimeError("Failed to persist search round")
     return row["round_id"]
 
 
@@ -147,6 +149,7 @@ async def get_run_search_progress(run_id: UUID) -> dict[str, Any]:
         """,
         run_id,
     )
+    aggregate = dict(row) if row is not None else {}
 
     # Per-source breakdown
     source_rows = await fetch_with_retry(
@@ -168,14 +171,18 @@ async def get_run_search_progress(run_id: UUID) -> dict[str, Any]:
 
     return {
         "run_id": str(run_id),
-        "total_rounds": row["total_rounds"] or 0,
-        "sources_used": row["sources_used"] or 0,
-        "hypotheses_used": row["hypotheses_used"] or 0,
-        "total_results": row["total_results"] or 0,
-        "total_verified": row["total_verified"] or 0,
-        "total_persisted": row["total_persisted"] or 0,
-        "saturated_rounds": row["saturated_rounds"] or 0,
-        "avg_signal_quality": float(row["avg_signal_quality"]) if row["avg_signal_quality"] else None,
+        "total_rounds": aggregate.get("total_rounds") or 0,
+        "sources_used": aggregate.get("sources_used") or 0,
+        "hypotheses_used": aggregate.get("hypotheses_used") or 0,
+        "total_results": aggregate.get("total_results") or 0,
+        "total_verified": aggregate.get("total_verified") or 0,
+        "total_persisted": aggregate.get("total_persisted") or 0,
+        "saturated_rounds": aggregate.get("saturated_rounds") or 0,
+        "avg_signal_quality": (
+            float(aggregate["avg_signal_quality"])
+            if aggregate.get("avg_signal_quality") is not None
+            else None
+        ),
         "per_source": [
             {
                 "source_name": r["source_name"],

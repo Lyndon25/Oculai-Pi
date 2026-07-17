@@ -314,7 +314,6 @@ class ArxivAPISource(IDataSource):
             top_categories = sorted(cat_counts.items(), key=lambda x: x[1], reverse=True)[:5]
 
             # Build an arXiv author search URL as a verifiable profile link
-            from urllib.parse import quote_plus
             arxiv_search_url = f"https://arxiv.org/search/?searchtype=author&query={quote_plus(name)}"
 
             candidates.append(

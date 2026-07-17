@@ -5,19 +5,27 @@ import type { SourcingRun, SystemStatus, SubagentState, PipelinePhase, ActivityE
 // ---- Agent streaming events ----
 
 export interface AgentThinkingEvent {
+  runId: string;
+  agentId: string;
   delta: string;
 }
 
 export interface AgentMessageEvent {
+  runId: string;
+  agentId: string;
   text: string;
 }
 
 export interface AgentToolCallEvent {
+  runId: string;
+  agentId: string;
   toolName: string;
   input: Record<string, unknown>;
 }
 
 export interface AgentToolResultEvent {
+  runId: string;
+  agentId: string;
   toolName: string;
   output: Record<string, unknown>;
   isError: boolean;
@@ -52,6 +60,7 @@ export interface OrchestratorPhaseEvent {
 // ---- Subagent events ----
 
 export interface SubagentSpawnedEvent {
+  runId: string;
   agentId: string;
   agentType: string;
   target: string;
@@ -59,11 +68,13 @@ export interface SubagentSpawnedEvent {
 }
 
 export interface SubagentProgressEvent {
+  runId: string;
   agentId: string;
   activity: ActivityEntry;
 }
 
 export interface SubagentCompletedEvent {
+  runId: string;
   agentId: string;
   agentType: string;
   target: string;
@@ -75,6 +86,7 @@ export interface SubagentCompletedEvent {
 // ---- Candidate events ----
 
 export interface CandidateUpsertedEvent {
+  runId: string;
   personId: string;
   name: string;
   institution: string;
@@ -127,6 +139,18 @@ export interface GetRunStatePayload {
 }
 
 export interface ExportReportPayload {
+  runId: string;
+  format?: "html" | "markdown";
+  approvalId: string;
+}
+
+export interface DecideHumanApprovalPayload {
+  approvalId: string;
+  decision: "approved" | "denied";
+  reviewNotes: string;
+}
+
+export interface RequestReportApprovalPayload {
   runId: string;
   format?: "html" | "markdown";
 }

@@ -9,7 +9,6 @@ Profile: GET /api/v4/people/{url_token}
 
 import logging
 import time
-from typing import Any
 
 import httpx
 

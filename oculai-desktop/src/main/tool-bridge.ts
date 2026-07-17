@@ -1,16 +1,8 @@
-/**
- * Tool Bridge — spawns the Python JSONL sidecar and provides a typed
- * callTool() interface for Pi extension tools.
- *
- * Protocol: stdin/stdout JSONL (one JSON object per line)
- *   → {"id":"req-1","method":"oculai_create_run","params":{...}}
- *   ← {"id":"req-1","ok":true,"result":{...}}
- *   ← {"id":"req-1","ok":false,"error":{"code":"...","message":"..."}}
- *
- * System messages on stderr: {"type":"ready","tools":41,"pid":12345}
- */
-import { ChildProcess, spawn } from "child_process";
-import { createInterface, Interface } from "readline";
+/** Concurrent, restartable JSONL transport for the Python Oculai sidecar. */
+import { type ChildProcess, spawn } from "node:child_process";
+import { existsSync } from "node:fs";
+import { join } from "node:path";
+import { createInterface, type Interface } from "node:readline";
 import { stateBus } from "./state-bus.js";
 
 export interface ToolResponse {
@@ -19,176 +11,426 @@ export interface ToolResponse {
   error?: { code: string; message: string; traceback?: string };
 }
 
-interface PendingRequest {
-  resolve: (value: ToolResponse) => void;
+export interface ToolCallOptions {
+  timeoutMs?: number;
+  signal?: AbortSignal;
+}
+
+export interface ToolBridgeOptions {
+  defaultTimeoutMs?: number;
+  maxInFlight?: number;
+  maxQueue?: number;
+  restartDelayMs?: number;
+  readyTimeoutMs?: number;
+}
+
+interface LaunchConfig {
+  command: string;
+  args: string[];
+}
+
+interface QueuedRequest {
+  id: string;
+  method: string;
+  params: Record<string, unknown>;
+  options: Required<Pick<ToolCallOptions, "timeoutMs">> & Pick<ToolCallOptions, "signal">;
+  resolve: (value: Record<string, unknown>) => void;
   reject: (reason: Error) => void;
+  abortListener?: () => void;
+}
+
+interface PendingRequest extends QueuedRequest {
   timer: NodeJS.Timeout;
 }
 
-const DEFAULT_TIMEOUT_MS = 120_000; // 2 minutes
+const DEFAULT_TIMEOUT_MS = 120_000;
 const SHUTDOWN_TIMEOUT_MS = 10_000;
 
+function abortError(message: string): Error {
+  const error = new Error(message);
+  error.name = "AbortError";
+  return error;
+}
+
+function defaultLaunchConfig(serverModule?: string): LaunchConfig {
+  if (serverModule) {
+    const python = process.platform === "win32" ? "python" : "python3";
+    return { command: python, args: [serverModule] };
+  }
+
+  // Packaged builds ship a self-contained sidecar. Development deliberately
+  // falls back to the active Python environment.
+  const resourcesPath = process.resourcesPath;
+  if (resourcesPath) {
+    const executable = join(
+      resourcesPath,
+      "runtime",
+      "python",
+      process.platform === "win32" ? "oculai-sidecar.exe" : "oculai-sidecar",
+    );
+    if (existsSync(executable)) return { command: executable, args: [] };
+  }
+
+  return {
+    command: process.platform === "win32" ? "python" : "python3",
+    args: ["-m", "oculai_mcp.jsonl_server"],
+  };
+}
+
 export class ToolBridge {
-  private process: ChildProcess | null = null;
-  private pending = new Map<string, PendingRequest>();
-  private reqCounter = 0;
-  private rl: Interface | null = null;
+  private child: ChildProcess | null = null;
+  private stdoutReader: Interface | null = null;
+  private stderrReader: Interface | null = null;
+  private readonly pending = new Map<string, PendingRequest>();
+  private readonly queue: QueuedRequest[] = [];
+  private requestCounter = 0;
+  private controlCounter = 0;
   private ready = false;
-  private shutdownPromise: Promise<void> | null = null;
+  private shouldRun = false;
+  private startPromise: Promise<void> | null = null;
+  private stopPromise: Promise<void> | null = null;
+  private restartTimer: NodeJS.Timeout | null = null;
+  private launchConfig: LaunchConfig | null = null;
+  private sidecarPid: number | undefined;
 
-  /**
-   * Start the Python JSONL server process.
-   * @param pythonCmd — path to python or PyInstaller executable
-   * @param serverModule — path or module name of jsonl_server.py
-   */
-  async start(pythonCmd = "python", serverModule?: string): Promise<void> {
-    if (this.process) return;
+  private readonly defaultTimeoutMs: number;
+  private readonly maxInFlight: number;
+  private readonly maxQueue: number;
+  private readonly restartDelayMs: number;
+  private readonly readyTimeoutMs: number;
 
-    const args = serverModule
-      ? [serverModule]
-      : ["-m", "oculai_mcp.jsonl_server"];
+  constructor(options: ToolBridgeOptions = {}) {
+    this.defaultTimeoutMs = options.defaultTimeoutMs ?? DEFAULT_TIMEOUT_MS;
+    this.maxInFlight = Math.max(1, options.maxInFlight ?? 32);
+    this.maxQueue = Math.max(0, options.maxQueue ?? 256);
+    this.restartDelayMs = Math.max(0, options.restartDelayMs ?? 1_000);
+    this.readyTimeoutMs = Math.max(100, options.readyTimeoutMs ?? 15_000);
+  }
 
-    stateBus.emitSystemLog("info", `Starting Python sidecar: ${pythonCmd} ${args.join(" ")}`);
+  get childPid(): number | undefined {
+    return this.ready ? (this.sidecarPid ?? this.child?.pid) : undefined;
+  }
 
-    this.process = spawn(pythonCmd, args, {
+  /** Start a sidecar and remember its launch command for automatic restart. */
+  async start(pythonCmd?: string, serverModule?: string): Promise<void> {
+    if (pythonCmd) {
+      const isStandalone = !serverModule && /oculai-sidecar(?:\.exe)?$/i.test(pythonCmd);
+      this.launchConfig = {
+        command: pythonCmd,
+        args: serverModule ? [serverModule] : isStandalone ? [] : ["-m", "oculai_mcp.jsonl_server"],
+      };
+    } else if (!this.launchConfig) {
+      this.launchConfig = defaultLaunchConfig(serverModule);
+    }
+
+    this.shouldRun = true;
+    if (this.ready && this.child) return;
+    if (this.startPromise) return this.startPromise;
+
+    this.startPromise = this.spawnAndWaitForReady().finally(() => {
+      this.startPromise = null;
+      if (this.shouldRun && !this.ready && !this.child) this.scheduleRestart();
+    });
+    return this.startPromise;
+  }
+
+  private async spawnAndWaitForReady(): Promise<void> {
+    if (this.child) return this.waitForReady(this.readyTimeoutMs);
+    const launch = this.launchConfig ?? defaultLaunchConfig();
+    this.launchConfig = launch;
+    stateBus.emitSystemLog("info", `Starting Python sidecar: ${launch.command} ${launch.args.join(" ")}`);
+
+    const child = spawn(launch.command, launch.args, {
       stdio: ["pipe", "pipe", "pipe"],
       shell: false,
+      windowsHide: true,
       env: { ...process.env, PYTHONUNBUFFERED: "1" },
     });
+    this.child = child;
+    this.ready = false;
+    this.sidecarPid = undefined;
 
-    // Parse stdout — JSONL tool responses
-    this.rl = createInterface({ input: this.process.stdout! });
-    this.rl.on("line", (line: string) => {
-      if (!line.trim()) return;
-      try {
-        const msg = JSON.parse(line);
-        const reqId = msg.id;
-        if (reqId && this.pending.has(reqId)) {
-          const { resolve, timer } = this.pending.get(reqId)!;
-          clearTimeout(timer);
-          this.pending.delete(reqId);
-          resolve(msg as ToolResponse);
-        }
-      } catch {
-        // Non-JSON stdout is ignored
+    this.stdoutReader = createInterface({ input: child.stdout! });
+    this.stdoutReader.on("line", (line) => this.handleResponseLine(line));
+
+    this.stderrReader = createInterface({ input: child.stderr! });
+    this.stderrReader.on("line", (line) => this.handleSystemLine(line));
+
+    child.once("error", (error) => {
+      stateBus.emitSystemLog("error", `Python sidecar error: ${error.message}`);
+      this.handleExit(child, null, error);
+    });
+    child.once("close", (code) => this.handleExit(child, code, undefined));
+
+    try {
+      await this.waitForReady(this.readyTimeoutMs);
+      this.drainQueue();
+    } catch (error) {
+      if (this.child === child && !child.killed) child.kill("SIGKILL");
+      throw error;
+    }
+  }
+
+  private handleResponseLine(line: string): void {
+    if (!line.trim()) return;
+    try {
+      const response = JSON.parse(line) as ToolResponse & { id?: string };
+      if (!response.id) return;
+      const request = this.pending.get(response.id);
+      if (!request) return; // late response to a timed out/cancelled request
+      this.pending.delete(response.id);
+      clearTimeout(request.timer);
+      this.cleanupAbortListener(request);
+
+      if (!response.ok) {
+        const error = response.error ?? { code: "UNKNOWN", message: "Unknown sidecar error" };
+        const failure = new Error(`Tool '${request.method}' failed: [${error.code}] ${error.message}`);
+        if (error.code === "CANCELLED") failure.name = "AbortError";
+        request.reject(failure);
+      } else {
+        request.resolve(response.result ?? {});
       }
-    });
+      this.drainQueue();
+    } catch (error) {
+      stateBus.emitSystemLog(
+        "warn",
+        `Ignored invalid sidecar stdout: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+  }
 
-    // Parse stderr — system messages (JSONL)
-    const errRl = createInterface({ input: this.process.stderr! });
-    errRl.on("line", (line: string) => {
-      if (!line.trim()) return;
-      try {
-        const msg = JSON.parse(line);
-        if (msg.type === "ready") {
-          this.ready = true;
-          stateBus.emitSystemLog("info", `Python sidecar ready: ${msg.tools} tools, pid ${msg.pid}`);
-        } else if (msg.type === "shutdown") {
-          stateBus.emitSystemLog("info", `Python sidecar shutdown: ${msg.reason}`);
-          this.ready = false;
-        }
-      } catch {
-        // Non-JSON stderr → system log
-        stateBus.emitSystemLog("debug", `[python] ${line}`);
+  private handleSystemLine(line: string): void {
+    if (!line.trim()) return;
+    try {
+      const message = JSON.parse(line) as Record<string, unknown>;
+      if (message.type === "ready") {
+        this.ready = true;
+        const reportedPid = Number(message.pid);
+        this.sidecarPid = Number.isSafeInteger(reportedPid) && reportedPid > 0
+          ? reportedPid
+          : this.child?.pid;
+        stateBus.emitSystemLog(
+          "info",
+          `Python sidecar ready: ${String(message.tools)} tools, pid ${String(message.pid)}`,
+        );
+        this.drainQueue();
+      } else if (message.type === "shutdown") {
+        this.ready = false;
+        stateBus.emitSystemLog("info", `Python sidecar shutdown: ${String(message.reason)}`);
       }
-    });
+    } catch {
+      stateBus.emitSystemLog("debug", `[python] ${line}`);
+    }
+  }
 
-    this.process.on("error", (err) => {
-      stateBus.emitSystemLog("error", `Python sidecar error: ${err.message}`);
-      this.ready = false;
-    });
+  private handleExit(child: ChildProcess, code: number | null, cause?: Error): void {
+    if (this.child !== child) return;
+    this.child = null;
+    this.ready = false;
+    this.sidecarPid = undefined;
+    this.stdoutReader?.close();
+    this.stderrReader?.close();
+    this.stdoutReader = null;
+    this.stderrReader = null;
 
-    this.process.on("close", (code) => {
-      stateBus.emitSystemLog("info", `Python sidecar exited with code ${code}`);
-      this.ready = false;
-      // Reject all pending requests
-      for (const [id, { reject, timer }] of this.pending) {
-        clearTimeout(timer);
-        reject(new Error(`Python sidecar exited (code ${code})`));
-        this.pending.delete(id);
-      }
-    });
+    const reason = cause?.message ?? `exit code ${String(code)}`;
+    stateBus.emitSystemLog(
+      !this.shouldRun && !cause && code === 0 ? "info" : "warn",
+      `Python sidecar stopped (${reason})`,
+    );
+    for (const request of this.pending.values()) {
+      clearTimeout(request.timer);
+      this.cleanupAbortListener(request);
+      request.reject(new Error(`Python sidecar exited while running '${request.method}' (${reason})`));
+    }
+    this.pending.clear();
 
-    // Wait for ready signal
-    await this.waitForReady(15000);
+    if (this.shouldRun) this.scheduleRestart();
+  }
+
+  private scheduleRestart(): void {
+    if (this.restartTimer || this.startPromise || !this.shouldRun) return;
+    this.restartTimer = setTimeout(() => {
+      this.restartTimer = null;
+      void this.start().catch((error: unknown) => {
+        stateBus.emitSystemLog(
+          "error",
+          `Python sidecar restart failed: ${error instanceof Error ? error.message : String(error)}`,
+        );
+        this.scheduleRestart();
+      });
+    }, this.restartDelayMs);
   }
 
   private waitForReady(timeoutMs: number): Promise<void> {
     return new Promise((resolve, reject) => {
-      if (this.ready) return resolve();
-      const start = Date.now();
-      const interval = setInterval(() => {
+      if (this.ready) {
+        resolve();
+        return;
+      }
+      const startedAt = Date.now();
+      const timer = setInterval(() => {
         if (this.ready) {
-          clearInterval(interval);
+          clearInterval(timer);
           resolve();
-        } else if (Date.now() - start > timeoutMs) {
-          clearInterval(interval);
-          reject(new Error("Python sidecar did not become ready within timeout"));
+        } else if (!this.child) {
+          clearInterval(timer);
+          reject(new Error("Python sidecar exited before becoming ready"));
+        } else if (Date.now() - startedAt >= timeoutMs) {
+          clearInterval(timer);
+          reject(new Error(`Python sidecar did not become ready within ${timeoutMs}ms`));
         }
-      }, 100);
+      }, 25);
     });
   }
 
-  /** Call a tool by name with parameters. Returns the tool's result dict. */
+  /** Queue a tool call with explicit timeout, cancellation, and backpressure. */
   async callTool(
     method: string,
     params: Record<string, unknown> = {},
-    timeoutMs = DEFAULT_TIMEOUT_MS,
+    optionsOrTimeout: ToolCallOptions | number = {},
   ): Promise<Record<string, unknown>> {
-    if (!this.process || !this.ready) {
-      throw new Error("Python sidecar not running");
+    const options = typeof optionsOrTimeout === "number"
+      ? { timeoutMs: optionsOrTimeout }
+      : optionsOrTimeout;
+    if (options.signal?.aborted) throw abortError(`Tool '${method}' was cancelled before dispatch`);
+
+    if (!this.ready || !this.child) {
+      await this.start();
     }
 
-    const id = `req-${++this.reqCounter}`;
-    const request = JSON.stringify({ id, method, params });
+    if (this.queue.length >= this.maxQueue && this.pending.size >= this.maxInFlight) {
+      throw new Error(
+        `Python sidecar backpressure limit reached (${this.maxInFlight} active, ${this.maxQueue} queued)`,
+      );
+    }
 
-    const response = await new Promise<ToolResponse>((resolve, reject) => {
-      const timer = setTimeout(() => {
-        this.pending.delete(id);
-        reject(new Error(`Tool call '${method}' timed out after ${timeoutMs}ms`));
-      }, timeoutMs);
-
-      this.pending.set(id, { resolve, reject, timer });
-      this.process!.stdin!.write(request + "\n");
+    const id = `req-${++this.requestCounter}`;
+    return new Promise<Record<string, unknown>>((resolve, reject) => {
+      const request: QueuedRequest = {
+        id,
+        method,
+        params,
+        options: { timeoutMs: options.timeoutMs ?? this.defaultTimeoutMs, signal: options.signal },
+        resolve,
+        reject,
+      };
+      if (options.signal) {
+        request.abortListener = () => this.cancelRequest(request, "aborted by caller");
+        options.signal.addEventListener("abort", request.abortListener, { once: true });
+      }
+      this.queue.push(request);
+      this.drainQueue();
     });
-
-    if (!response.ok) {
-      const err = response.error || { code: "UNKNOWN", message: "Unknown error" };
-      throw new Error(`Tool '${method}' failed: [${err.code}] ${err.message}`);
-    }
-
-    return response.result || {};
   }
 
-  /** Check if the sidecar is running and ready. */
+  private drainQueue(): void {
+    if (!this.ready || !this.child?.stdin?.writable) return;
+    while (this.pending.size < this.maxInFlight && this.queue.length > 0) {
+      const request = this.queue.shift()!;
+      if (request.options.signal?.aborted) {
+        this.cleanupAbortListener(request);
+        request.reject(abortError(`Tool '${request.method}' was cancelled before dispatch`));
+        continue;
+      }
+
+      const timer = setTimeout(() => {
+        this.cancelRequest(request, `timed out after ${request.options.timeoutMs}ms`);
+      }, request.options.timeoutMs);
+      this.pending.set(request.id, { ...request, timer });
+
+      const line = JSON.stringify({ id: request.id, method: request.method, params: request.params }) + "\n";
+      this.child.stdin.write(line, (error) => {
+        if (!error) return;
+        const active = this.pending.get(request.id);
+        if (!active) return;
+        clearTimeout(active.timer);
+        this.pending.delete(request.id);
+        this.cleanupAbortListener(active);
+        active.reject(new Error(`Failed to write tool '${request.method}' to sidecar: ${error.message}`));
+        this.drainQueue();
+      });
+    }
+  }
+
+  private cancelRequest(request: QueuedRequest, reason: string): void {
+    const queuedIndex = this.queue.findIndex((item) => item.id === request.id);
+    if (queuedIndex >= 0) {
+      const [queued] = this.queue.splice(queuedIndex, 1);
+      this.cleanupAbortListener(queued);
+      queued.reject(abortError(`Tool '${queued.method}' ${reason}`));
+      return;
+    }
+
+    const active = this.pending.get(request.id);
+    if (!active) return;
+    clearTimeout(active.timer);
+    this.pending.delete(request.id);
+    this.cleanupAbortListener(active);
+    active.reject(abortError(`Tool '${active.method}' ${reason}`));
+    this.sendCancelFrame(active.id);
+    this.drainQueue();
+  }
+
+  private sendCancelFrame(requestId: string): void {
+    if (!this.ready || !this.child?.stdin?.writable) return;
+    const line = JSON.stringify({
+      id: `cancel-${++this.controlCounter}`,
+      method: "$cancel",
+      params: { request_id: requestId },
+    }) + "\n";
+    this.child.stdin.write(line);
+  }
+
+  private cleanupAbortListener(request: QueuedRequest): void {
+    if (request.abortListener && request.options.signal) {
+      request.options.signal.removeEventListener("abort", request.abortListener);
+    }
+  }
+
   isReady(): boolean {
     return this.ready;
   }
 
-  /** Gracefully shut down the Python process. */
-  async stop(): Promise<void> {
-    if (!this.process) return;
-    if (this.shutdownPromise) return this.shutdownPromise;
+  getLoad(): { active: number; queued: number; maxInFlight: number; maxQueue: number } {
+    return {
+      active: this.pending.size,
+      queued: this.queue.length,
+      maxInFlight: this.maxInFlight,
+      maxQueue: this.maxQueue,
+    };
+  }
 
-    this.shutdownPromise = new Promise<void>((resolve) => {
-      const closeTimeout = setTimeout(() => {
-        if (this.process && !this.process.killed) {
-          this.process.kill("SIGKILL");
-        }
+  /** Gracefully stop and reject queued work. Automatic restart is disabled. */
+  async stop(): Promise<void> {
+    this.shouldRun = false;
+    if (this.restartTimer) {
+      clearTimeout(this.restartTimer);
+      this.restartTimer = null;
+    }
+    if (this.stopPromise) return this.stopPromise;
+
+    for (const request of this.queue.splice(0)) {
+      this.cleanupAbortListener(request);
+      request.reject(abortError(`Tool '${request.method}' cancelled because sidecar is stopping`));
+    }
+    const child = this.child;
+    if (!child) return;
+
+    this.stopPromise = new Promise<void>((resolve) => {
+      const timeout = setTimeout(() => {
+        if (!child.killed) child.kill("SIGKILL");
         resolve();
       }, SHUTDOWN_TIMEOUT_MS);
-
-      this.process!.on("close", () => {
-        clearTimeout(closeTimeout);
+      child.once("close", () => {
+        clearTimeout(timeout);
         resolve();
       });
-
-      // Send EOF to stdin to trigger graceful shutdown
-      if (this.process!.stdin) {
-        this.process!.stdin.end();
-      }
+      child.stdin?.end();
+    }).finally(() => {
+      this.stopPromise = null;
     });
 
-    return this.shutdownPromise;
+    return this.stopPromise;
   }
 }

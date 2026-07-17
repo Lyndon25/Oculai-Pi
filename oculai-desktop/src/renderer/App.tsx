@@ -130,6 +130,7 @@ export default function App() {
     unsubs.push(
       window.oculai.on("run:error", (payload: unknown) => {
         const data = payload as RunErrorEvent;
+        if (data.runId !== useStore.getState().activeRunId) return;
         addMessage({
           role: "system",
           content: `Run ${data.runId} failed during ${data.phase}: ${data.error}`,
@@ -149,7 +150,8 @@ export default function App() {
     // Agent messages
     unsubs.push(
       window.oculai.on("agent:message", (payload: unknown) => {
-        const data = payload as { text: string };
+        const data = payload as { runId: string; agentId: string; text: string };
+        if (data.runId !== useStore.getState().activeRunId) return;
         addMessage({
           role: "assistant",
           content: data.text,
@@ -161,7 +163,8 @@ export default function App() {
     // Agent thinking
     unsubs.push(
       window.oculai.on("agent:thinking", (payload: unknown) => {
-        const data = payload as { delta: string };
+        const data = payload as { runId: string; agentId: string; delta: string };
+        if (data.runId !== useStore.getState().activeRunId) return;
         addMessage({
           role: "assistant",
           content: data.delta,
@@ -174,7 +177,13 @@ export default function App() {
     // Tool calls
     unsubs.push(
       window.oculai.on("agent:tool_call", (payload: unknown) => {
-        const data = payload as { toolName: string; input: Record<string, unknown> };
+        const data = payload as {
+          runId: string;
+          agentId: string;
+          toolName: string;
+          input: Record<string, unknown>;
+        };
+        if (data.runId !== useStore.getState().activeRunId) return;
         addMessage({
           role: "tool",
           content: `${data.toolName}(${JSON.stringify(data.input).slice(0, 100)}...)`,
@@ -188,10 +197,13 @@ export default function App() {
     unsubs.push(
       window.oculai.on("agent:tool_result", (payload: unknown) => {
         const data = payload as {
+          runId: string;
+          agentId: string;
           toolName: string;
           output: Record<string, unknown>;
           isError: boolean;
         };
+        if (data.runId !== useStore.getState().activeRunId) return;
         addMessage({
           role: "tool",
           content: data.isError
@@ -225,7 +237,11 @@ export default function App() {
     unsubs.push(
       window.oculai.on("orchestrator:phase", (payload: unknown) => {
         const data = payload as OrchestratorPhaseEvent;
+        if (data.runId !== useStore.getState().activeRunId) return;
         setOrchestratorPhase(data.phase);
+        if (data.phase === "complete") {
+          useStore.getState().updateRun(data.runId, { status: "completed" });
+        }
       }),
     );
 
@@ -233,6 +249,7 @@ export default function App() {
     unsubs.push(
       window.oculai.on("subagent:spawned", (payload: unknown) => {
         const data = payload as SubagentSpawnedEvent;
+        if (data.runId !== useStore.getState().activeRunId) return;
         addSubagent({
           agentId: data.agentId,
           agentType: data.agentType,
@@ -254,6 +271,7 @@ export default function App() {
     unsubs.push(
       window.oculai.on("subagent:progress", (payload: unknown) => {
         const data = payload as SubagentProgressEvent;
+        if (data.runId !== useStore.getState().activeRunId) return;
         addActivity(data.activity);
       }),
     );
@@ -262,6 +280,7 @@ export default function App() {
     unsubs.push(
       window.oculai.on("subagent:completed", (payload: unknown) => {
         const data = payload as SubagentCompletedEvent;
+        if (data.runId !== useStore.getState().activeRunId) return;
         updateSubagent(data.agentId, {
           status: data.status,
           resultCount: data.resultCount,
@@ -284,6 +303,7 @@ export default function App() {
     unsubs.push(
       window.oculai.on("candidate:upserted", (payload: unknown) => {
         const data = payload as CandidateUpsertedEvent;
+        if (data.runId !== useStore.getState().activeRunId) return;
         const candidate: Candidate = {
           person_id: data.personId,
           canonical_name: data.name,
@@ -313,6 +333,7 @@ export default function App() {
     unsubs.push(
       window.oculai.on("report:ready", (payload: unknown) => {
         const data = payload as { runId: string; html: string; format: string };
+        if (data.runId !== useStore.getState().activeRunId) return;
         useStore.getState().setReportHtml(data.html);
         useStore.getState().setActiveTab("report");
         addActivity({

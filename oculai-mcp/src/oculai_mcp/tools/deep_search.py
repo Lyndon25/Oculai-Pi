@@ -13,8 +13,8 @@ from uuid import UUID
 from oculai_mcp.db import search_state
 from oculai_mcp.db.client import fetch_with_retry
 from oculai_mcp.tools import candidates as candidates_tool
-from oculai_mcp.tools.sources import search_source
 from oculai_mcp.tools.site_crawler import crawl_site
+from oculai_mcp.tools.sources import search_source
 
 logger = logging.getLogger(__name__)
 
@@ -245,14 +245,11 @@ async def _search_combo(
     base_keywords = hypothesis.get("keywords", [])
     max_rounds = combo_budget
     saturation_threshold = config["saturation_threshold"]
-    min_signal_quality = config["min_signal_quality"]
     low_signal_cutoff = config["low_signal_cutoff"]
 
     rounds_history: list[dict[str, Any]] = []
     all_candidates: list[dict[str, Any]] = []
     total_persisted = 0
-    start_time = time.monotonic()
-
     for round_num in range(1, max_rounds + 1):
         # Hard limits check
         if global_state["total_calls"] >= config["max_total_calls"]:
@@ -269,7 +266,6 @@ async def _search_combo(
         limit = 25  # slightly higher than default 20 for deep search
 
         # Execute search
-        t0 = time.monotonic()
         try:
             result = await search_source(
                 source_name=source_name,
@@ -281,7 +277,6 @@ async def _search_combo(
             logger.warning("Search error %s/%s round %d: %s", source_name, hypothesis_id, round_num, e)
             result = {"status": "error", "error": {"message": str(e)}, "candidates": []}
 
-        search_latency = time.monotonic() - t0
         global_state["total_calls"] += 1
 
         raw_candidates = result.get("candidates", []) if result.get("status") == "success" else []
@@ -504,7 +499,6 @@ async def deep_search(
     probe_tasks = []
 
     for h in hypotheses:
-        hid = h.get("hypothesis_id", "unknown")
         for source_name in all_sources:
             # Check if source has queries for this hypothesis
             initial_queries = h.get("initial_queries", {})
@@ -565,7 +559,6 @@ async def deep_search(
 
     deep_tasks = []
     for h in hypotheses:
-        hid = h.get("hypothesis_id", "unknown")
         for source_name in all_sources:
             if source_name not in budget_allocation or budget_allocation[source_name] <= 0:
                 continue

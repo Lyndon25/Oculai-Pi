@@ -10,7 +10,7 @@
  * 6. Ready for user interaction
  */
 import { app, BrowserWindow, shell, screen } from "electron";
-import { join, dirname } from "path";
+import { dirname } from "path";
 import { fileURLToPath } from "url";
 import { existsSync, mkdirSync } from "fs";
 import { PostgresManager } from "./postgres-manager.js";
@@ -19,6 +19,7 @@ import { initPiSession, disposeSession } from "./pi-session.js";
 import { registerIpcHandlers } from "./ipc-handlers.js";
 import { stateBus } from "./state-bus.js";
 import { getSettingsStore } from "./settings-store.js";
+import { packagedPreloadEntry, packagedRendererEntry } from "./application-paths.js";
 
 // Prevent multiple instances
 const gotLock = app.requestSingleInstanceLock();
@@ -36,6 +37,9 @@ const __dirname = dirname(__filename);
 
 // Backend lifecycle state — prevents races between start and shutdown
 let backendState: "stopped" | "starting" | "running" | "stopping" = "stopped";
+let backendStartPromise: Promise<void> | null = null;
+let backendStopPromise: Promise<void> | null = null;
+let quitAfterShutdown = false;
 
 function createWindow(): void {
   const { workAreaSize } = screen.getPrimaryDisplay();
@@ -51,7 +55,7 @@ function createWindow(): void {
     titleBarStyle: "hiddenInset",
     frame: process.platform === "darwin" ? false : true,
     webPreferences: {
-      preload: join(__dirname, "..", "preload", "index.cjs"),
+      preload: packagedPreloadEntry(__dirname),
       sandbox: false,
       contextIsolation: true,
       nodeIntegration: false,
@@ -89,7 +93,7 @@ function createWindow(): void {
     mainWindow.loadURL("http://localhost:5173");
     mainWindow.webContents.openDevTools({ mode: "detach" });
   } else {
-    mainWindow.loadFile(join(__dirname, "..", "renderer", "index.html"));
+    mainWindow.loadFile(packagedRendererEntry(__dirname));
   }
 
   mainWindow.once("ready-to-show", () => {
@@ -115,6 +119,7 @@ async function startBackend(): Promise<void> {
     return;
   }
   backendState = "starting";
+  let databaseReady = false;
 
   // 1. Start PostgreSQL
   try {
@@ -128,6 +133,7 @@ async function startBackend(): Promise<void> {
       dbPort: dbConfig.port,
     });
     stateBus.emitSystemLog("info", `PostgreSQL ready on port ${dbConfig.port}`);
+    databaseReady = true;
 
     // Set DB env for Python sidecar
     process.env.DB_HOST = dbConfig.host;
@@ -154,52 +160,66 @@ async function startBackend(): Promise<void> {
     ["baidu", "BAIDU_API_KEY"],
   ];
   for (const [provider, envVar] of sourceKeyEnvMap) {
-    const key = getSettingsStore().getApiKey(provider);
-    if (key) {
-      process.env[envVar] = key;
+    try {
+      const key = getSettingsStore().getApiKey(provider);
+      if (key) process.env[envVar] = key;
+    } catch (error) {
+      stateBus.emitSystemLog(
+        "error",
+        `Credential '${provider}' is unavailable: ${error instanceof Error ? error.message : String(error)}`,
+      );
     }
   }
 
   // 2. Start Python sidecar
+  const dbStatus = databaseReady ? "connected" as const : "error" as const;
   try {
     stateBus.emitSystemStatus({
-      db: "connected",
+      db: dbStatus,
       python: "starting",
       llm: "unconfigured",
     });
 
-    const pythonCmd = process.platform === "win32" ? "python" : "python3";
-    await toolBridge.start(pythonCmd);
+    await toolBridge.start();
     stateBus.emitSystemStatus({
-      db: "connected",
+      db: dbStatus,
       python: "ready",
       llm: "unconfigured",
-      pythonPid: process.pid,
+      pythonPid: toolBridge.childPid,
     });
   } catch (err) {
     stateBus.emitSystemLog("error", `Python sidecar failed: ${err}`);
-    stateBus.emitSystemStatus({ db: "connected", python: "error", llm: "unconfigured" });
+    stateBus.emitSystemStatus({ db: dbStatus, python: "error", llm: "unconfigured" });
     // Continue — user can retry
   }
 
   // 3. Initialize Pi session (if API keys configured)
   const settings = getSettingsStore();
-  const apiKey = settings.getApiKey(settings.get("llmProvider"));
+  let apiKey: string | null = null;
+  let credentialError: Error | null = null;
+  try {
+    apiKey = settings.getApiKey(settings.get("llmProvider"));
+  } catch (error) {
+    credentialError = error instanceof Error ? error : new Error(String(error));
+    stateBus.emitSystemLog("error", credentialError.message);
+  }
   if (apiKey) {
     try {
-      await initPiSession(toolBridge, postgresManager);
+      await initPiSession(toolBridge);
       stateBus.emitSystemStatus({
-        db: "connected",
+        db: dbStatus,
         python: "ready",
         llm: "configured",
       });
     } catch (err) {
       stateBus.emitSystemLog("error", `Pi session init failed: ${err}`);
-      stateBus.emitSystemStatus({ db: "connected", python: "ready", llm: "error" });
+      stateBus.emitSystemStatus({ db: dbStatus, python: "ready", llm: "error" });
     }
+  } else if (credentialError) {
+    stateBus.emitSystemStatus({ db: dbStatus, python: "ready", llm: "error" });
   } else {
     stateBus.emitSystemLog("warn", "No API key configured. Set one in Settings to enable AI agent.");
-    stateBus.emitSystemStatus({ db: "connected", python: "ready", llm: "unconfigured" });
+    stateBus.emitSystemStatus({ db: dbStatus, python: "ready", llm: "unconfigured" });
   }
 
   // 4. IPC handlers are registered during app startup before slow backend work.
@@ -209,29 +229,41 @@ async function startBackend(): Promise<void> {
 }
 
 async function shutdownBackend(): Promise<void> {
-  if (backendState !== "running") {
-    stateBus.emitSystemLog("warn", `shutdownBackend called while state=${backendState}, ignoring`);
-    return;
+  if (backendStopPromise) return backendStopPromise;
+  if (backendState === "starting" && backendStartPromise) {
+    try {
+      await backendStartPromise;
+    } catch {
+      // Startup failures are reflected in backend state/status; cleanup still runs.
+    }
   }
+  if (backendState === "stopped") return;
+  if (backendState === "stopping") return backendStopPromise ?? Promise.resolve();
+
   backendState = "stopping";
-  stateBus.emitSystemLog("info", "Shutting down...");
-
-  disposeSession();
-
-  try {
-    await toolBridge.stop();
-  } catch {
-    // Ignore
-  }
-
-  try {
-    await postgresManager.stop();
-  } catch {
-    // Ignore
-  }
-
-  backendState = "stopped";
-  stateBus.emitSystemLog("info", "Shutdown complete");
+  backendStopPromise = (async () => {
+    stateBus.emitSystemLog("info", "Shutting down...");
+    try {
+      await disposeSession();
+    } catch (error) {
+      stateBus.emitSystemLog("error", `Pi session shutdown failed: ${String(error)}`);
+    }
+    try {
+      await toolBridge.stop();
+    } catch (error) {
+      stateBus.emitSystemLog("error", `Python sidecar shutdown failed: ${String(error)}`);
+    }
+    try {
+      await postgresManager.stop();
+    } catch (error) {
+      stateBus.emitSystemLog("error", `PostgreSQL shutdown failed: ${String(error)}`);
+    }
+    stateBus.emitSystemLog("info", "Shutdown complete");
+  })().finally(() => {
+    backendState = "stopped";
+    backendStopPromise = null;
+  });
+  return backendStopPromise;
 }
 
 // ---- App Lifecycle ----
@@ -245,7 +277,35 @@ app.whenReady().then(async () => {
 
   createWindow();
   registerIpcHandlers(toolBridge, postgresManager);
-  await startBackend();
+  const closeDuringStartMs = Number(process.env.OCULAI_SMOKE_CLOSE_DURING_START_MS ?? 0);
+  if (
+    Number.isFinite(closeDuringStartMs)
+    && closeDuringStartMs >= 100
+    && closeDuringStartMs <= 300_000
+  ) {
+    console.log(`[smoke] scheduling close during backend startup in ${closeDuringStartMs}ms`);
+    setTimeout(() => {
+      if (mainWindow && !mainWindow.isDestroyed()) mainWindow.close();
+    }, closeDuringStartMs);
+  }
+  backendStartPromise = startBackend();
+  try {
+    await backendStartPromise;
+  } finally {
+    backendStartPromise = null;
+  }
+
+  // Deterministic packaged-app lifecycle smoke hook.  It is disabled unless
+  // the launcher explicitly supplies a bounded delay, and closes the window
+  // through Electron so the normal shutdownBackend path is exercised.
+  const smokeExitMs = Number(process.env.OCULAI_SMOKE_EXIT_MS ?? 0);
+  if (Number.isFinite(smokeExitMs) && smokeExitMs >= 1000 && smokeExitMs <= 300_000) {
+    console.log(`[smoke] scheduling graceful window close in ${smokeExitMs}ms`);
+    setTimeout(() => {
+      if (mainWindow && !mainWindow.isDestroyed()) mainWindow.close();
+      else app.quit();
+    }, smokeExitMs);
+  }
 
   app.on("activate", () => {
     if (BrowserWindow.getAllWindows().length === 0) {
@@ -257,12 +317,18 @@ app.whenReady().then(async () => {
 app.on("window-all-closed", async () => {
   await shutdownBackend();
   if (process.platform !== "darwin") {
+    quitAfterShutdown = true;
     app.quit();
   }
 });
 
-app.on("before-quit", async () => {
-  await shutdownBackend();
+app.on("before-quit", (event) => {
+  if (quitAfterShutdown || backendState === "stopped") return;
+  event.preventDefault();
+  void shutdownBackend().finally(() => {
+    quitAfterShutdown = true;
+    app.quit();
+  });
 });
 
 // Handle second instance

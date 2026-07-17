@@ -265,11 +265,11 @@ class ConferenceSource(IDataSource):
         """
         if not conferences:
             # Default: all top conferences
-            tokens: set[str] = set()
+            default_tokens: set[str] = set()
             for names in TOP_CONFERENCES.values():
                 for n in names[:3]:
-                    tokens.add(n.lower())
-            return sorted(tokens)
+                    default_tokens.add(n.lower())
+            return sorted(default_tokens)
 
         tokens: set[str] = set()
         for spec in conferences:

@@ -3,7 +3,7 @@
 import logging
 from typing import Any
 
-from oculai_mcp.db.client import execute_with_retry, fetchval_with_retry, fetchrow_with_retry
+from oculai_mcp.db.client import execute_with_retry, fetchrow_with_retry, fetchval_with_retry
 
 logger = logging.getLogger(__name__)
 

@@ -10,7 +10,8 @@ from typing import Any
 from uuid import UUID
 
 from oculai_mcp.db.client import execute_with_retry, fetch_with_retry, fetchrow_with_retry
-from oculai_mcp.tools.assessment_weights import ROLE_WEIGHTS, check_gates, get_gates, get_weights
+from oculai_mcp.tools.assessment_weights import ROLE_WEIGHTS, get_gates, get_weights
+from oculai_mcp.tools.errors import ValidationError
 
 logger = logging.getLogger(__name__)
 
@@ -48,13 +49,20 @@ async def score_candidate(
     - Computes confidence-weighted overall with role-type weights
     - Enforces must-pass gates (failure caps overall at 5.0)
     """
-    parsed_evidence_ids = [UUID(e) for e in evidence_ids] if evidence_ids else []
+    _validate_assessment_input(dimensions, confidence, role_type)
+    try:
+        parsed_evidence_ids = [UUID(e) for e in evidence_ids] if evidence_ids else []
+    except (TypeError, ValueError) as exc:
+        raise ValidationError("evidence_ids must contain valid UUIDs") from exc
+    await _validate_evidence_references(run_id, person_id, parsed_evidence_ids)
     assessment_ids = []
-    validation_issues = []
+    validation_issues: list[dict[str, Any]] = []
 
     for dim, score in dimensions.items():
         # Validate evidence requirements — filter evidence relevant to this dimension
-        dim_evidence_ids = await _filter_evidence_for_dimension(parsed_evidence_ids, dim)
+        dim_evidence_ids = await _filter_evidence_for_dimension(
+            parsed_evidence_ids, dim, run_id, person_id
+        )
         validation = await validate_evidence_for_score(
             run_id=run_id,
             person_id=person_id,
@@ -65,6 +73,15 @@ async def score_candidate(
         if not validation["valid"]:
             validation_issues.append(validation)
 
+    # Reject the complete batch before the first write. This avoids partially
+    # persisted assessments and makes evidence requirements a hard constraint.
+    if validation_issues:
+        raise ValidationError(
+            "assessment rejected because evidence requirements were not met",
+            details={"validation_issues": validation_issues},
+        )
+
+    for dim, score in dimensions.items():
         # Check if this dimension already has a score (for history tracking)
         existing = await fetchrow_with_retry(
             """
@@ -139,7 +156,27 @@ async def record_assessment(
     - Tracks score history when scores change
     - Re-computes overall with role-type weights
     """
-    parsed_evidence_ids = [UUID(e) for e in evidence_ids] if evidence_ids else []
+    _validate_assessment_input({dimension: score}, confidence, role_type)
+    try:
+        parsed_evidence_ids = [UUID(e) for e in evidence_ids] if evidence_ids else []
+    except (TypeError, ValueError) as exc:
+        raise ValidationError("evidence_ids must contain valid UUIDs") from exc
+    await _validate_evidence_references(run_id, person_id, parsed_evidence_ids)
+    relevant_evidence_ids = await _filter_evidence_for_dimension(
+        parsed_evidence_ids, dimension, run_id, person_id
+    )
+    validation = await validate_evidence_for_score(
+        run_id=run_id,
+        person_id=person_id,
+        dimension=dimension,
+        score=score,
+        evidence_ids=relevant_evidence_ids,
+    )
+    if not validation["valid"]:
+        raise ValidationError(
+            "assessment rejected because evidence requirements were not met",
+            details={"validation_issues": [validation]},
+        )
 
     # Check existing for history tracking
     existing = await fetchrow_with_retry(
@@ -212,6 +249,7 @@ async def get_shortlist(
         JOIN person p ON p.person_id = cr.person_id
         WHERE cr.run_id = $1
           AND (cr.quality_score >= $2 OR $2 = 0)
+          AND cr.match_scores->>'gate_status' = 'passed'
         ORDER BY cr.quality_score DESC
         LIMIT $3
         """,
@@ -292,32 +330,55 @@ async def _compute_overall_score(person_id: UUID, run_id: UUID, role_type: str =
     )
 
     weighted_sum = 0.0
-    confidence_sum = 0.0
-    gate_failures = []
-    dim_scores = {}
+    gate_failures: list[dict[str, Any]] = []
+    dim_scores: dict[str, dict[str, float]] = {}
+    by_dimension: dict[str, list[tuple[float, float]]] = {}
 
     for r in rows:
         dim = r["dimension"]
-        score = r["score"]
-        conf = r["confidence"] if r["confidence"] is not None else 0.5
-        w = weights.get(dim)
-        if w is None:
+        if dim not in weights:
             # Unknown dimension — skip from weighted average to avoid inflating the total
             logger.warning("Dimension '%s' has no weight in role_type '%s' — skipping", dim, role_type)
             continue
 
-        weighted_sum += score * w * conf
-        confidence_sum += w * conf
-        dim_scores[dim] = {"score": score, "confidence": conf}
+        score = float(r["score"])
+        conf = float(r["confidence"] if r["confidence"] is not None else 0.5)
+        by_dimension.setdefault(dim, []).append((score, conf))
 
-        # Gate check
-        if dim in gates and score < gates[dim]:
-            gate_failures.append({"dimension": dim, "required": gates[dim], "actual": score})
+    # Aggregate multiple assessors once per dimension. Missing dimensions and
+    # low confidence reduce the score instead of being normalised away.
+    for dim, assessments in by_dimension.items():
+        total_confidence = sum(conf for _, conf in assessments)
+        if total_confidence > 0:
+            score = sum(score * conf for score, conf in assessments) / total_confidence
+            conf = min(1.0, total_confidence / len(assessments))
+        else:
+            score = sum(score for score, _ in assessments) / len(assessments)
+            conf = 0.0
+        weighted_sum += score * weights[dim] * conf
+        dim_scores[dim] = {"score": round(score, 2), "confidence": round(conf, 3)}
 
-    if confidence_sum > 0:
-        overall = round(weighted_sum / confidence_sum, 1)
-    else:
-        overall = 0.0
+    # Missing required dimensions are hard gate failures.
+    for dim, required in gates.items():
+        aggregate = dim_scores.get(dim)
+        if aggregate is None:
+            gate_failures.append({
+                "dimension": dim,
+                "required": required,
+                "actual": None,
+                "reason": "required_dimension_missing",
+            })
+        elif aggregate["score"] < required:
+            gate_failures.append({
+                "dimension": dim,
+                "required": required,
+                "actual": aggregate["score"],
+                "reason": "below_required_score",
+            })
+
+    # Role weights sum to one, so this is the full-profile weighted score.
+    overall = round(weighted_sum, 1)
+    assessed_weight = sum(weights[dim] for dim in by_dimension)
 
     # Gate failure caps score at 5.0
     if gate_failures:
@@ -334,6 +395,9 @@ async def _compute_overall_score(person_id: UUID, run_id: UUID, role_type: str =
         "gate_status": gate_status,
         "gate_failures": gate_failures,
         "confidence_adjusted": True,
+        "normalization": "full_profile_weight",
+        "assessment_coverage": round(assessed_weight, 3),
+        "missing_dimensions": sorted(set(weights) - set(by_dimension)),
         "computed_at": datetime.now(timezone.utc).isoformat(),
     }
 
@@ -357,6 +421,8 @@ async def _compute_overall_score(person_id: UUID, run_id: UUID, role_type: str =
 async def _filter_evidence_for_dimension(
     evidence_ids: list[UUID],
     dimension: str,
+    run_id: UUID,
+    person_id: UUID,
 ) -> list[UUID]:
     """Filter evidence IDs to only those relevant to the given assessment dimension.
 
@@ -373,8 +439,9 @@ async def _filter_evidence_for_dimension(
 
     # Query evidence types for the given IDs
     rows = await fetch_with_retry(
-        "SELECT evidence_id, evidence_type FROM evidence WHERE evidence_id = ANY($1)",
-        evidence_ids,
+        """SELECT evidence_id, evidence_type FROM evidence
+           WHERE evidence_id = ANY($1) AND run_id = $2 AND person_id = $3""",
+        evidence_ids, run_id, person_id,
     )
     type_map = {r["evidence_id"]: r["evidence_type"] for r in rows}
 
@@ -405,8 +472,9 @@ async def validate_evidence_for_score(
 
     if evidence_ids:
         rows = await fetch_with_retry(
-            "SELECT evidence_id, tier FROM evidence WHERE evidence_id = ANY($1)",
-            evidence_ids,
+            """SELECT evidence_id, tier FROM evidence
+               WHERE evidence_id = ANY($1) AND run_id = $2 AND person_id = $3""",
+            evidence_ids, run_id, person_id,
         )
         tiers = {r["evidence_id"]: r["tier"] for r in rows}
         tier_1_count = sum(1 for t in tiers.values() if t == 1)
@@ -422,9 +490,81 @@ async def validate_evidence_for_score(
         if score >= 5.0 and tier_1_count + tier_2_count == 0:
             return {
                 "valid": False,
-                "reason": f"Score >= 5 requires Tier 1/2 evidence, found none",
+                "reason": "Score >= 5 requires Tier 1/2 evidence, found none",
                 "required_tier": 2,
                 "found_tiers": {str(k): v for k, v in tiers.items()},
             }
 
     return {"valid": True}
+
+
+def _validate_assessment_input(
+    dimensions: dict[str, float], confidence: float, role_type: str
+) -> None:
+    """Validate assessment values before any database interaction."""
+    if role_type not in ROLE_WEIGHTS:
+        raise ValidationError(
+            f"unknown role_type {role_type!r}; must be one of {sorted(ROLE_WEIGHTS)}"
+        )
+    if not dimensions:
+        raise ValidationError("at least one assessment dimension is required")
+    unknown = sorted(set(dimensions) - set(ROLE_WEIGHTS[role_type]))
+    if unknown:
+        raise ValidationError(
+            "unknown assessment dimensions",
+            details={"unknown_dimensions": unknown},
+        )
+    invalid_scores = {
+        dim: score
+        for dim, score in dimensions.items()
+        if not isinstance(score, (int, float))
+        or isinstance(score, bool)
+        or not 0 <= score <= 10
+    }
+    if invalid_scores:
+        raise ValidationError(
+            "assessment scores must be numeric values between 0 and 10",
+            details={"invalid_scores": invalid_scores},
+        )
+    if (
+        not isinstance(confidence, (int, float))
+        or isinstance(confidence, bool)
+        or not 0 <= confidence <= 1
+    ):
+        raise ValidationError("confidence must be a numeric value between 0 and 1")
+
+
+async def _validate_evidence_references(
+    run_id: UUID, person_id: UUID, evidence_ids: list[UUID]
+) -> None:
+    """Reject missing or cross-run/person evidence references."""
+    if not evidence_ids:
+        return
+    if len(set(evidence_ids)) != len(evidence_ids):
+        raise ValidationError("evidence_ids must not contain duplicates")
+
+    rows = await fetch_with_retry(
+        """SELECT evidence_id, run_id, person_id FROM evidence
+           WHERE evidence_id = ANY($1)""",
+        evidence_ids,
+    )
+    by_id = {row["evidence_id"]: row for row in rows}
+    missing = [str(evidence_id) for evidence_id in evidence_ids if evidence_id not in by_id]
+    mismatched = [
+        {
+            "evidence_id": str(evidence_id),
+            "actual_run_id": str(by_id[evidence_id]["run_id"]),
+            "actual_person_id": str(by_id[evidence_id]["person_id"]),
+        }
+        for evidence_id in evidence_ids
+        if evidence_id in by_id
+        and (
+            by_id[evidence_id]["run_id"] != run_id
+            or by_id[evidence_id]["person_id"] != person_id
+        )
+    ]
+    if missing or mismatched:
+        raise ValidationError(
+            "evidence_ids must exist and belong to the assessed run/person",
+            details={"missing_evidence_ids": missing, "mismatched_evidence": mismatched},
+        )

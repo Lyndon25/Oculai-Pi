@@ -69,7 +69,10 @@ def _extract_links(html: str, base_url: str) -> set[str]:
     soup = BeautifulSoup(html, "html.parser")
     links: set[str] = set()
     for tag in soup.find_all("a", href=True):
-        href = tag["href"]
+        raw_href = tag.get("href")
+        if not isinstance(raw_href, str):
+            continue
+        href = raw_href
         if href.startswith("#"):
             continue
         absolute = urljoin(base_url, href)

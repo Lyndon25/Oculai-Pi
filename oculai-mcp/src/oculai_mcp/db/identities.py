@@ -4,7 +4,7 @@ import logging
 from typing import Any
 from uuid import UUID
 
-from oculai_mcp.db.client import execute_with_retry, fetch_with_retry, fetchval_with_retry
+from oculai_mcp.db.client import execute_with_retry, fetchval_with_retry
 
 logger = logging.getLogger(__name__)
 

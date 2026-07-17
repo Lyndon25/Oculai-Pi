@@ -6,6 +6,7 @@
  */
 import { app, ipcMain } from "electron";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "fs";
+import { userInfo } from "node:os";
 import { join } from "path";
 import { IPC_CHANNELS } from "../shared/ipc-channels.js";
 import type {
@@ -14,12 +15,17 @@ import type {
   GetCandidatesPayload,
   GetRunStatePayload,
   StartRunPayload,
+  DecideHumanApprovalPayload,
+  RequestReportApprovalPayload,
 } from "../shared/events.js";
-import { getSession, initPiSession } from "./pi-session.js";
+import { getPiSessionManager, initPiSession, validatePiModel } from "./pi-session.js";
 import { ToolBridge } from "./tool-bridge.js";
 import { PostgresManager } from "./postgres-manager.js";
 import { getSettingsStore } from "./settings-store.js";
 import { stateBus } from "./state-bus.js";
+import { evaluateRunCompletion } from "./run-completion.js";
+import type { PersistedRunStatus } from "./run-lifecycle.js";
+import { buildHumanApprovalDecision } from "./human-approval.js";
 import type { AcademicWork, Assessment, Candidate, CandidateDetail, CareerEvent, Evidence, SourcingRun } from "../shared/types.js";
 
 // ---- Recent Runs persistence (local JSON file, survives app restarts) ----
@@ -61,6 +67,41 @@ function asNumber(value: unknown): number | undefined {
     return Number.isFinite(parsed) ? parsed : undefined;
   }
   return undefined;
+}
+
+function validateSetting(key: string, value: unknown): void {
+  if (["llmProvider", "llmModel"].includes(key)) {
+    if (typeof value !== "string" || !value.trim()) throw new Error(`${key} must be a non-empty string`);
+    return;
+  }
+  if (key === "thinkingLevel") {
+    if (!["off", "low", "medium", "high"].includes(String(value))) {
+      throw new Error("thinkingLevel must be off, low, medium, or high");
+    }
+    return;
+  }
+  if (key === "enabledSources") {
+    if (!value || typeof value !== "object" || Array.isArray(value) ||
+      Object.values(value as Record<string, unknown>).some((enabled) => typeof enabled !== "boolean")) {
+      throw new Error("enabledSources must map source names to booleans");
+    }
+    return;
+  }
+  if (key === "dbAutoStart") {
+    if (typeof value !== "boolean") throw new Error("dbAutoStart must be boolean");
+    return;
+  }
+  if (["dbPort", "maxIterations", "tokenBudget", "concurrency"].includes(key)) {
+    if (typeof value !== "number" || !Number.isInteger(value)) throw new Error(`${key} must be an integer`);
+    const ranges: Record<string, [number, number]> = {
+      dbPort: [0, 65_535],
+      maxIterations: [1, 10_000],
+      tokenBudget: [1_000, 100_000_000],
+      concurrency: [1, 32],
+    };
+    const [min, max] = ranges[key];
+    if (value < min || value > max) throw new Error(`${key} must be between ${min} and ${max}`);
+  }
 }
 
 function normalizeCandidate(rawValue: unknown): Candidate {
@@ -274,12 +315,79 @@ function saveRunToRecent(run: RecentRunEntry): void {
   writeFileSync(recentRunsPath(), JSON.stringify(trimmed, null, 2), "utf-8");
 }
 
-export function registerIpcHandlers(toolBridge: ToolBridge, postgresManager?: PostgresManager): void {
+export function registerIpcHandlers(toolBridge: ToolBridge, postgresManager: PostgresManager): void {
+  // Reserved synchronously before any await. This closes the duplicate
+  // START/RESUME race while PiSessionManager supplies per-run context isolation.
+  const reservedRuns = new Set<string>();
+
+  const persistRunStatus = async (
+    runId: string,
+    status: PersistedRunStatus,
+    title: string,
+  ): Promise<boolean> => {
+    try {
+      await postgresManager.updateRunStatus(runId, status);
+    } catch (error) {
+      stateBus.emitSystemLog(
+        "debug",
+        `Run ${runId} status '${status}' was not persisted: ${error instanceof Error ? error.message : String(error)}`,
+      );
+      return false;
+    }
+    const existing = readRecentRuns().find((run) => run.run_id === runId);
+    saveRunToRecent({
+      run_id: runId,
+      title,
+      status,
+      created_at: existing?.created_at ?? new Date().toISOString(),
+      candidate_count: existing?.candidate_count,
+    });
+    return true;
+  };
+
+  const launchExecution = (
+    runId: string,
+    title: string,
+    prompt: string,
+    preReserved = false,
+  ): void => {
+    const runtime = getPiSessionManager();
+    if (!runtime) throw new Error("LLM runtime is not configured");
+    if ((!preReserved && reservedRuns.has(runId)) || runtime.hasActiveRun(runId)) {
+      throw new Error(`Run '${runId}' is already active`);
+    }
+    if (!preReserved) reservedRuns.add(runId);
+    void runtime.startRun(runId, prompt).then(async () => {
+      const durableState = await toolBridge.callTool("oculai_get_run_state", { run_id: runId });
+      const completion = evaluateRunCompletion(durableState);
+      if (!completion.canComplete) {
+        await persistRunStatus(runId, "paused", title);
+        stateBus.emitSystemLog(
+          "warn",
+          `Run ${runId} paused instead of completed: ${completion.reason}`,
+        );
+        return;
+      }
+      const persisted = await persistRunStatus(runId, "completed", title);
+      if (persisted) stateBus.emitPhaseChange(runId, "complete");
+    }).catch(async (error: unknown) => {
+      const message = error instanceof Error ? error.message : String(error);
+      await persistRunStatus(runId, "aborted", title);
+      if (!(error instanceof Error && error.name === "AbortError")) {
+        stateBus.emitRunError(runId, message, "pipeline");
+      }
+    }).finally(() => {
+      reservedRuns.delete(runId);
+    });
+  };
+
   // ---- Run lifecycle ----
 
   ipcMain.handle(IPC_CHANNELS.START_RUN, async (_event, payload: StartRunPayload) => {
     try {
       stateBus.emitSystemLog("info", `Starting new run: ${payload.jobTitle}`);
+
+      if (!getPiSessionManager()) throw new Error("Configure a valid LLM provider and API key first");
 
       const store = getSettingsStore();
       const runtimeConfig = {
@@ -299,30 +407,26 @@ export function registerIpcHandlers(toolBridge: ToolBridge, postgresManager?: Po
         config: runtimeConfig,
       });
 
+      const runId = result.run_id as string;
+      await postgresManager.updateRunStatus(runId, "running");
       stateBus.emitRunCreated(
-        result.run_id as string,
+        runId,
         payload.jobTitle,
-        "draft",
+        "running",
       );
 
       // Persist run metadata to recent-runs.json for cross-session history
       saveRunToRecent({
-        run_id: result.run_id as string,
+        run_id: runId,
         title: payload.jobTitle,
-        status: "draft",
+        status: "running",
         created_at: new Date().toISOString(),
         candidate_count: 0,
       });
 
       // Kick off the Pi agent to run the full pipeline
-      const session = getSession();
-      if (session) {
-        const runId = result.run_id as string;
-        const prompt = buildPipelinePrompt(runId, { ...payload, config: runtimeConfig });
-        session.prompt(prompt).catch((err: unknown) => {
-          stateBus.emitRunError(runId, err instanceof Error ? err.message : String(err), "pipeline");
-        });
-      }
+      const prompt = buildPipelinePrompt(runId, { ...payload, config: runtimeConfig });
+      launchExecution(runId, payload.jobTitle, prompt);
 
       return result;
     } catch (err) {
@@ -343,11 +447,13 @@ export function registerIpcHandlers(toolBridge: ToolBridge, postgresManager?: Po
 
   ipcMain.handle(IPC_CHANNELS.ABORT_RUN, async (_event, payload: { runId: string }) => {
     stateBus.emitSystemLog("info", `Aborting run: ${payload.runId}`);
-    // The run can be aborted by stopping the session prompt
-    const session = getSession();
-    if (session) {
-      session.abort();
-    }
+    const runtime = getPiSessionManager();
+    const state = normalizeRunStateSummary(
+      await toolBridge.callTool("oculai_get_run_state", { run_id: payload.runId }),
+    );
+    const run = asRecord(state.run);
+    await runtime?.abortRun(payload.runId);
+    await persistRunStatus(payload.runId, "aborted", asString(run.title, "Untitled run"));
     return { status: "aborted" };
   });
 
@@ -358,7 +464,30 @@ export function registerIpcHandlers(toolBridge: ToolBridge, postgresManager?: Po
     );
     const recent = recentRunFromState(state);
     if (recent) saveRunToRecent(recent);
-    return state;
+    const run = asRecord(state.run);
+    const status = asString(run.status);
+    if (status === "completed") throw new Error(`Completed run '${payload.runId}' cannot be resumed`);
+    if (!getPiSessionManager()) throw new Error("Configure a valid LLM provider and API key first");
+    if (reservedRuns.has(payload.runId) || getPiSessionManager()?.hasActiveRun(payload.runId)) {
+      throw new Error(`Run '${payload.runId}' is already active`);
+    }
+    reservedRuns.add(payload.runId);
+    try {
+      await postgresManager.updateRunStatus(payload.runId, "running");
+      launchExecution(
+        payload.runId,
+        asString(run.title, "Untitled run"),
+        buildResumePrompt(payload.runId, state),
+        true,
+      );
+    } catch (error) {
+      reservedRuns.delete(payload.runId);
+      throw error;
+    }
+    return {
+      ...state,
+      run: { ...run, status: "running", updated_at: new Date().toISOString() },
+    };
   });
 
   // ---- Candidates ----
@@ -388,6 +517,7 @@ export function registerIpcHandlers(toolBridge: ToolBridge, postgresManager?: Po
     const result = await toolBridge.callTool("oculai_export_report", {
       run_id: payload.runId,
       format: payload.format || "html",
+      approval_id: payload.approvalId,
     });
     const html = asOptionalString(result.html_content ?? result.html);
     if (html) {
@@ -395,6 +525,47 @@ export function registerIpcHandlers(toolBridge: ToolBridge, postgresManager?: Po
     }
     return { ...result, html_content: html };
   });
+
+  ipcMain.handle(
+    IPC_CHANNELS.DECIDE_HUMAN_APPROVAL,
+    async (_event, payload: DecideHumanApprovalPayload) => {
+      // Identity and role are fixed at the trusted desktop boundary. Neither
+      // the renderer payload nor any agent can claim a privileged reviewer role.
+      let reviewerId = "oculai-desktop-user";
+      try {
+        reviewerId = userInfo().username.trim() || reviewerId;
+      } catch {
+        // The stable fallback still identifies the trusted local desktop path.
+      }
+      return toolBridge.callTool(
+        "oculai_decide_human_approval",
+        buildHumanApprovalDecision(payload, reviewerId),
+      );
+    },
+  );
+
+  ipcMain.handle(
+    IPC_CHANNELS.REQUEST_REPORT_APPROVAL,
+    async (_event, payload: RequestReportApprovalPayload) => {
+      if (!payload.runId) throw new Error("Run id is required");
+      const format = payload.format || "html";
+      return toolBridge.callTool("oculai_request_human_approval", {
+        run_id: payload.runId,
+        action_type: "export_report",
+        action_context: { format },
+        draft_content: `Export ${format.toUpperCase()} sourcing report for run ${payload.runId}`,
+        agent_id: "oculai-desktop-ui",
+      });
+    },
+  );
+
+  ipcMain.handle(
+    IPC_CHANNELS.LIST_PENDING_APPROVALS,
+    async (_event, payload: { runId: string }) => {
+      if (!payload.runId) throw new Error("Run id is required");
+      return toolBridge.callTool("oculai_list_pending_approvals", { run_id: payload.runId });
+    },
+  );
 
   // ---- Recent Runs ----
 
@@ -416,23 +587,46 @@ export function registerIpcHandlers(toolBridge: ToolBridge, postgresManager?: Po
       "enabledSources", "dbPort", "dbAutoStart",
       "maxIterations", "tokenBudget", "concurrency",
     ]);
-    for (const [key, value] of Object.entries(settings)) {
+    const accepted = Object.entries(settings).filter(([key]) => {
       if (!knownKeys.has(key)) {
         stateBus.emitSystemLog("warn", `Rejected unknown setting key: ${key}`);
-        continue;
+        return false;
       }
+      return true;
+    });
+    for (const [key, value] of accepted) validateSetting(key, value);
+
+    const proposedProvider = String(settings.llmProvider ?? store.get("llmProvider"));
+    const proposedModel = String(settings.llmModel ?? store.get("llmModel"));
+    if (settings.llmProvider !== undefined || settings.llmModel !== undefined) {
+      await validatePiModel(proposedProvider, proposedModel);
+    }
+    for (const [key, value] of accepted) {
       store.set(key as never, value as never);
     }
-    return { ok: true };
+    getPiSessionManager()?.refreshSettings();
+    const restartRequired = accepted.some(([key]) => key === "dbPort" || key === "dbAutoStart");
+    if (restartRequired) {
+      stateBus.emitSystemLog("info", "Database startup settings saved and will apply on the next app launch");
+    }
+    return {
+      ok: true,
+      restartRequired,
+      appliesToActiveRuns: false,
+      appliesToNewRuns: true,
+    };
   });
 
   ipcMain.handle(IPC_CHANNELS.SETTINGS_SET_API_KEY, async (_event, payload: { provider: string; key: string }) => {
+    if (!payload.provider?.trim() || !payload.key?.trim()) {
+      throw new Error("Provider and API key are required");
+    }
     const store = getSettingsStore();
     store.setApiKey(payload.provider, payload.key);
 
-    if (payload.provider === store.get("llmProvider") && postgresManager && !getSession()) {
+    if (payload.provider === store.get("llmProvider") && !getPiSessionManager()) {
       try {
-        await initPiSession(toolBridge, postgresManager);
+        await initPiSession(toolBridge);
         stateBus.emitSystemStatus({ db: "connected", python: "ready", llm: "configured" });
         stateBus.emitSystemLog("info", `LLM provider '${payload.provider}' configured for current session.`);
       } catch (err) {
@@ -441,6 +635,8 @@ export function registerIpcHandlers(toolBridge: ToolBridge, postgresManager?: Po
         stateBus.emitSystemLog("error", `Failed to initialize Pi session after API key save: ${msg}`);
       }
     }
+
+    getPiSessionManager()?.refreshSettings();
 
     return { ok: true, apiKeyStatus: getSettingsStore().getAll().apiKeyStatus };
   });
@@ -475,4 +671,18 @@ ${skills}${domains}${config}
 The run has been created (run_id="${runId}"). Begin orchestrating the talent sourcing pipeline.
 Analyze the JD, design your search strategy, spawn subagents as needed, and find the best
 China-based candidates for this role.`;
+}
+
+function buildResumePrompt(runId: string, state: Record<string, unknown>): string {
+  return `## Resume Talent Sourcing Run
+
+Run ID: ${runId}
+
+The durable run state below was loaded from PostgreSQL. Continue from existing
+plans, tasks, candidates, evidence, and review checkpoints. Do not recreate
+completed work. Reclaim only ready/pending tasks, resolve remaining gaps, run
+the mandatory quality audit, and export the final report.
+
+Current state snapshot:
+${JSON.stringify(state, null, 2)}`;
 }

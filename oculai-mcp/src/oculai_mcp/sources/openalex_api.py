@@ -31,7 +31,11 @@ async def _with_retry(
     coro: Callable[[], Any],
     max_retries: int = 3,
     base_delay: float = 1.0,
-    retryable: tuple[type, ...] = (httpx.ConnectError, httpx.TimeoutException, httpx.NetworkError),
+    retryable: tuple[type[Exception], ...] = (
+        httpx.ConnectError,
+        httpx.TimeoutException,
+        httpx.NetworkError,
+    ),
 ) -> Any:
     """Execute coroutine with exponential backoff retry."""
     last_exc: Exception | None = None

@@ -247,32 +247,6 @@ class _ParamAccessVisitor(ast.NodeVisitor):
             return val.args[0].value
         return None
 
-    # --- visitors ---
-
-    def visit_Assign(self, node: ast.Assign) -> None:
-        if len(node.targets) != 1:
-            self.generic_visit(node)
-            return
-        target = node.targets[0]
-        if not isinstance(target, ast.Name):
-            self.generic_visit(node)
-            return
-
-        self._record_access(node.value)
-        self.generic_visit(node)
-
-    def visit_AnnAssign(self, node: ast.AnnAssign) -> None:
-        # e.g. run_id: str = params["run_id"]
-        if not isinstance(node.target, ast.Name):
-            self.generic_visit(node)
-            return
-        if node.value is None:
-            self.generic_visit(node)
-            return
-
-        self._record_access(node.value)
-        self.generic_visit(node)
-
     def _record_access(self, val: ast.expr, annotation: ast.expr | None = None) -> None:
         required: bool | None = None
         key = self._extract_subscript_key(val)

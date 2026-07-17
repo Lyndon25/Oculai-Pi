@@ -90,6 +90,8 @@ CREATE INDEX IF NOT EXISTS idx_task_run_type ON Task (run_id, task_type, status)
 CREATE INDEX IF NOT EXISTS idx_task_claim ON Task (run_id, status, priority DESC, created_at ASC) WHERE status = 'pending';
 CREATE INDEX IF NOT EXISTS idx_task_claimed ON Task (claimed_by, status) WHERE claimed_by IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_task_failed ON Task (status, retry_count) WHERE status = 'error';
+CREATE UNIQUE INDEX IF NOT EXISTS uq_task_plan_step_key
+    ON Task (plan_id, step_key) WHERE step_key IS NOT NULL;
 
 -- ============================================================
 -- TaskDependency indexes
@@ -135,6 +137,18 @@ CREATE INDEX IF NOT EXISTS idx_fe_type ON FeedbackEvent (event_type);
 CREATE INDEX IF NOT EXISTS idx_fe_provided_at ON FeedbackEvent (provided_at DESC);
 
 -- ============================================================
+-- TaskIteration indexes
+-- ============================================================
+CREATE INDEX IF NOT EXISTS idx_task_iteration_task ON TaskIteration (task_id, iteration_number);
+CREATE INDEX IF NOT EXISTS idx_task_iteration_type ON TaskIteration (iteration_type, created_at);
+CREATE INDEX IF NOT EXISTS idx_task_iteration_decision ON TaskIteration (decision, created_at);
+
+-- ============================================================
+-- AgentBroadcast indexes
+-- ============================================================
+CREATE INDEX IF NOT EXISTS idx_broadcast_run ON AgentBroadcast (run_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_broadcast_discovered_by ON AgentBroadcast (run_id, discovered_by, created_at DESC);
+
 -- ============================================================
 -- SearchQueryLog indexes
 -- ============================================================

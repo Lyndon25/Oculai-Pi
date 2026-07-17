@@ -8,13 +8,11 @@ from uuid import UUID, uuid4
 
 import asyncpg
 
-from oculai_mcp.db.client import execute_with_retry, fetch_with_retry, fetchrow_with_retry
+from oculai_mcp.db.client import execute_with_retry, fetch_with_retry
 from oculai_mcp.tools.errors import (
     ConflictError,
     InternalError,
-    NotFoundError,
     ValidationError,
-    ok,
 )
 
 # Valid evidence types (must match evidence_type_t domain in 002_enums.sql)
@@ -61,7 +59,7 @@ async def attach_evidence(
         metadata_dict = metadata or {}
 
         # Auto-assign tier and quality flags
-        from oculai_mcp.tools.evidence_tier import get_tier, _detect_quality_flags
+        from oculai_mcp.tools.evidence_tier import _detect_quality_flags, get_tier
         tier = get_tier(source_name, evidence_type)
         quality_flags = _detect_quality_flags(source_name, content_dict)
 

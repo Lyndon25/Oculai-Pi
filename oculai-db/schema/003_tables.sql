@@ -270,8 +270,8 @@ CREATE TABLE IF NOT EXISTS Task (
     failed_at          TIMESTAMPTZ,
     error_message      TEXT,
 
-    retry_count        INTEGER DEFAULT 0,
-    max_retries        INTEGER DEFAULT 3,
+    retry_count        INTEGER NOT NULL DEFAULT 0 CHECK (retry_count >= 0),
+    max_retries        INTEGER NOT NULL DEFAULT 3 CHECK (max_retries >= 1),
 
     created_by_agent   TEXT NOT NULL DEFAULT 'system',
     updated_by_agent   TEXT NOT NULL DEFAULT 'system',

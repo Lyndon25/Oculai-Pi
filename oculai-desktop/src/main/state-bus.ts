@@ -40,20 +40,28 @@ export class StateBus {
 
   // ---- Agent streaming ----
 
-  emitThinking(delta: string): void {
-    this.send(IPC_CHANNELS.AGENT_THINKING, { delta } satisfies AgentThinkingEvent);
+  emitThinking(runId: string, agentId: string, delta: string): void {
+    this.send(IPC_CHANNELS.AGENT_THINKING, { runId, agentId, delta } satisfies AgentThinkingEvent);
   }
 
-  emitMessage(text: string): void {
-    this.send(IPC_CHANNELS.AGENT_MESSAGE, { text } satisfies AgentMessageEvent);
+  emitMessage(runId: string, agentId: string, text: string): void {
+    this.send(IPC_CHANNELS.AGENT_MESSAGE, { runId, agentId, text } satisfies AgentMessageEvent);
   }
 
-  emitToolCall(toolName: string, input: Record<string, unknown>): void {
-    this.send(IPC_CHANNELS.AGENT_TOOL_CALL, { toolName, input } satisfies AgentToolCallEvent);
+  emitToolCall(runId: string, agentId: string, toolName: string, input: Record<string, unknown>): void {
+    this.send(IPC_CHANNELS.AGENT_TOOL_CALL, { runId, agentId, toolName, input } satisfies AgentToolCallEvent);
   }
 
-  emitToolResult(toolName: string, output: Record<string, unknown>, isError = false): void {
+  emitToolResult(
+    runId: string,
+    agentId: string,
+    toolName: string,
+    output: Record<string, unknown>,
+    isError = false,
+  ): void {
     this.send(IPC_CHANNELS.AGENT_TOOL_RESULT, {
+      runId,
+      agentId,
       toolName,
       output,
       isError,
@@ -82,8 +90,9 @@ export class StateBus {
 
   // ---- Subagent lifecycle ----
 
-  emitSubagentSpawned(agentId: string, agentType: string, target: string): void {
+  emitSubagentSpawned(runId: string, agentId: string, agentType: string, target: string): void {
     this.send(IPC_CHANNELS.SUBAGENT_SPAWNED, {
+      runId,
       agentId,
       agentType,
       target,
@@ -91,14 +100,16 @@ export class StateBus {
     } satisfies SubagentSpawnedEvent);
   }
 
-  emitSubagentProgress(agentId: string, activity: ActivityEntry): void {
+  emitSubagentProgress(runId: string, agentId: string, activity: ActivityEntry): void {
     this.send(IPC_CHANNELS.SUBAGENT_PROGRESS, {
+      runId,
       agentId,
       activity,
     } satisfies SubagentProgressEvent);
   }
 
   emitSubagentCompleted(
+    runId: string,
     agentId: string,
     agentType: string,
     target: string,
@@ -107,6 +118,7 @@ export class StateBus {
     error?: string,
   ): void {
     this.send(IPC_CHANNELS.SUBAGENT_COMPLETED, {
+      runId,
       agentId,
       agentType,
       target,
@@ -118,8 +130,15 @@ export class StateBus {
 
   // ---- Candidates ----
 
-  emitCandidateUpserted(personId: string, name: string, institution?: string, sourceName?: string): void {
+  emitCandidateUpserted(
+    runId: string,
+    personId: string,
+    name: string,
+    institution?: string,
+    sourceName?: string,
+  ): void {
     this.send(IPC_CHANNELS.CANDIDATE_UPSERTED, {
+      runId,
       personId,
       name,
       institution: institution ?? "",
@@ -136,10 +155,15 @@ export class StateBus {
   // ---- System ----
 
   emitSystemStatus(status: SystemStatus): void {
+    console.log(`[system:status] ${JSON.stringify(status)}`);
     this.send(IPC_CHANNELS.SYSTEM_STATUS, { status } satisfies SystemStatusEvent);
   }
 
   emitSystemLog(level: SystemLogEvent["level"], message: string): void {
+    const rendered = `[system:${level}] ${message}`;
+    if (level === "error") console.error(rendered);
+    else if (level === "warn") console.warn(rendered);
+    else console.log(rendered);
     this.send(IPC_CHANNELS.SYSTEM_LOG, {
       level,
       message,

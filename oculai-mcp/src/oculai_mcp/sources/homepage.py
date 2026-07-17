@@ -171,7 +171,7 @@ class PersonalHomepageSource(IDataSource):
         except httpx.HTTPStatusError as e:
             logger.warning("Homepage fetch failed for %s: HTTP %s", url, e.response.status_code)
             return None
-        except Exception as e:
+        except Exception:
             logger.exception("Homepage fetch failed for %s", url)
             return None
 

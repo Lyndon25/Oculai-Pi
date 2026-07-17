@@ -4,10 +4,10 @@ import time
 from typing import Any
 from uuid import UUID
 
-from oculai_mcp.sources.base import SearchQuery
-from oculai_mcp.sources.registry import create_source, get_all_capabilities, list_sources as list_registered_sources
 from oculai_mcp.db.provenance import log_source_call
-from oculai_mcp.tools.errors import SourceError, ok, err
+from oculai_mcp.sources.base import SearchQuery
+from oculai_mcp.sources.registry import create_source, get_all_capabilities
+from oculai_mcp.tools.errors import err
 
 
 async def list_source_capabilities() -> dict[str, Any]:

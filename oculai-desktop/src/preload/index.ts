@@ -9,6 +9,8 @@ import type {
   GetCandidatesPayload,
   GetRunStatePayload,
   StartRunPayload,
+  DecideHumanApprovalPayload,
+  RequestReportApprovalPayload,
 } from "../shared/events.js";
 
 const api = {
@@ -33,6 +35,17 @@ const api = {
 
   exportReport: (payload: ExportReportPayload) =>
     ipcRenderer.invoke(IPC_CHANNELS.EXPORT_REPORT, payload),
+
+  // Human approval decisions deliberately have a dedicated renderer -> main
+  // action. The LLM never receives this channel or the underlying tool.
+  decideHumanApproval: (payload: DecideHumanApprovalPayload) =>
+    ipcRenderer.invoke(IPC_CHANNELS.DECIDE_HUMAN_APPROVAL, payload),
+
+  requestReportApproval: (payload: RequestReportApprovalPayload) =>
+    ipcRenderer.invoke(IPC_CHANNELS.REQUEST_REPORT_APPROVAL, payload),
+
+  listPendingApprovals: (runId: string) =>
+    ipcRenderer.invoke(IPC_CHANNELS.LIST_PENDING_APPROVALS, { runId }),
 
   listRuns: () =>
     ipcRenderer.invoke(IPC_CHANNELS.LIST_RUNS),
@@ -78,7 +91,25 @@ const api = {
   },
 
   removeAllListeners: (channel: string) => {
-    ipcRenderer.removeAllListeners(channel);
+    const allowedEventChannels = [
+      IPC_CHANNELS.RUN_CREATED,
+      IPC_CHANNELS.RUN_ERROR,
+      IPC_CHANNELS.ORCHESTRATOR_PHASE,
+      IPC_CHANNELS.SUBAGENT_SPAWNED,
+      IPC_CHANNELS.SUBAGENT_PROGRESS,
+      IPC_CHANNELS.SUBAGENT_COMPLETED,
+      IPC_CHANNELS.CANDIDATE_UPSERTED,
+      IPC_CHANNELS.AGENT_THINKING,
+      IPC_CHANNELS.AGENT_MESSAGE,
+      IPC_CHANNELS.AGENT_TOOL_CALL,
+      IPC_CHANNELS.AGENT_TOOL_RESULT,
+      IPC_CHANNELS.REPORT_READY,
+      IPC_CHANNELS.SYSTEM_STATUS,
+      IPC_CHANNELS.SYSTEM_LOG,
+    ];
+    if (allowedEventChannels.includes(channel as never)) {
+      ipcRenderer.removeAllListeners(channel);
+    }
   },
 };
 

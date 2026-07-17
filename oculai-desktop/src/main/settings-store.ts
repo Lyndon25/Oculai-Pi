@@ -14,8 +14,11 @@ export interface AppSettings {
   llmModel: string;
   thinkingLevel: "off" | "low" | "medium" | "high";
 
-  // API keys (stored encrypted or obfuscated at rest; never exposed to renderer)
+  // API keys (stored only with OS-backed encryption; never exposed to renderer)
   apiKeys: Record<string, string>;
+
+  // Main-process-only encrypted secrets (never exposed to renderer).
+  internalSecrets: Record<string, string>;
 
   // Source toggles
   enabledSources: Record<string, boolean>;
@@ -30,7 +33,7 @@ export interface AppSettings {
   concurrency: number;
 }
 
-export type SafeAppSettings = Omit<AppSettings, "apiKeys"> & {
+export type SafeAppSettings = Omit<AppSettings, "apiKeys" | "internalSecrets"> & {
   apiKeyStatus: Record<string, boolean>;
 };
 
@@ -40,6 +43,7 @@ const DEFAULT_SETTINGS: AppSettings = {
   thinkingLevel: "medium",
 
   apiKeys: {},
+  internalSecrets: {},
 
   enabledSources: {
     arxiv: true,
@@ -97,6 +101,10 @@ export class SettingsStore {
             ...DEFAULT_SETTINGS.apiKeys,
             ...(parsed.apiKeys ?? {}),
           },
+          internalSecrets: {
+            ...DEFAULT_SETTINGS.internalSecrets,
+            ...(parsed.internalSecrets ?? {}),
+          },
           enabledSources: {
             ...DEFAULT_SETTINGS.enabledSources,
             ...(parsed.enabledSources ?? {}),
@@ -109,6 +117,7 @@ export class SettingsStore {
     return {
       ...DEFAULT_SETTINGS,
       apiKeys: { ...DEFAULT_SETTINGS.apiKeys },
+      internalSecrets: { ...DEFAULT_SETTINGS.internalSecrets },
       enabledSources: { ...DEFAULT_SETTINGS.enabledSources },
     };
   }
@@ -120,8 +129,8 @@ export class SettingsStore {
   }
 
   getAll(): SafeAppSettings {
-    // Never expose API key values (encrypted or plaintext fallback) to the renderer.
-    const { apiKeys, ...safe } = this.settings;
+    // Never expose OS-encrypted API key values to the renderer.
+    const { apiKeys, internalSecrets: _internalSecrets, ...safe } = this.settings;
     return {
       ...safe,
       enabledSources: { ...safe.enabledSources },
@@ -150,26 +159,52 @@ export class SettingsStore {
   // ---- API key management with encryption ----
 
   setApiKey(provider: string, key: string): void {
-    if (safeStorage.isEncryptionAvailable()) {
-      const encrypted = safeStorage.encryptString(key);
-      this.settings.apiKeys[provider] = encrypted.toString("base64");
-    } else {
-      // Fallback: store with simple obfuscation (not secure, but better than plaintext)
-      this.settings.apiKeys[provider] = Buffer.from(key).toString("base64");
+    if (!safeStorage.isEncryptionAvailable()) {
+      throw new Error("OS secure storage is unavailable; refusing to persist API credentials");
     }
+    const encrypted = safeStorage.encryptString(key);
+    this.settings.apiKeys[provider] = encrypted.toString("base64");
     this.save();
   }
 
   getApiKey(provider: string): string | null {
     const stored = this.settings.apiKeys[provider];
     if (!stored) return null;
+    if (!safeStorage.isEncryptionAvailable()) {
+      throw new Error("OS secure storage is unavailable; cannot decrypt API credentials");
+    }
     try {
-      if (safeStorage.isEncryptionAvailable()) {
-        return safeStorage.decryptString(Buffer.from(stored, "base64"));
-      }
-      return Buffer.from(stored, "base64").toString("utf-8");
-    } catch {
-      return null;
+      return safeStorage.decryptString(Buffer.from(stored, "base64"));
+    } catch (error) {
+      throw new Error(
+        `Stored credential for '${provider}' is corrupt or uses the retired Base64 fallback. ` +
+        `Remove and re-enter the credential: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+  }
+
+  /** Persist a main-process secret. Unlike legacy API-key fallback behavior,
+   * this strict API refuses to store plaintext-equivalent data. */
+  setInternalSecret(name: string, value: string): void {
+    if (!safeStorage.isEncryptionAvailable()) {
+      throw new Error("OS secure storage is unavailable; refusing to persist internal secret");
+    }
+    this.settings.internalSecrets[name] = safeStorage.encryptString(value).toString("base64");
+    this.save();
+  }
+
+  getInternalSecret(name: string): string | null {
+    const stored = this.settings.internalSecrets[name];
+    if (!stored) return null;
+    if (!safeStorage.isEncryptionAvailable()) {
+      throw new Error("OS secure storage is unavailable; cannot decrypt internal secret");
+    }
+    try {
+      return safeStorage.decryptString(Buffer.from(stored, "base64"));
+    } catch (error) {
+      throw new Error(
+        `Failed to decrypt internal secret '${name}': ${error instanceof Error ? error.message : String(error)}`,
+      );
     }
   }
 

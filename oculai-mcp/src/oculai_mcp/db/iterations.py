@@ -4,7 +4,7 @@ import logging
 from typing import Any
 from uuid import UUID
 
-from oculai_mcp.db.client import fetch_with_retry, fetchrow_with_retry, execute_with_retry
+from oculai_mcp.db.client import fetch_with_retry, fetchrow_with_retry
 
 logger = logging.getLogger(__name__)
 
@@ -60,6 +60,8 @@ async def record_iteration(
         reasoning_text, action_taken, action_params or {},
         observation_text, observation_data or {}, decision, decision_rationale,
     )
+    if row is None:
+        raise RuntimeError("Failed to persist task iteration")
     iteration_id = row["iteration_id"]
     logger.debug("Recorded iteration %s for task=%s step=%s type=%s", iteration_id, task_id, iteration_number, iteration_type)
     return iteration_id

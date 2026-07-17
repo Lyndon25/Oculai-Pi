@@ -90,6 +90,8 @@ CREATE INDEX IF NOT EXISTS idx_task_run_type ON Task (run_id, task_type, status)
 CREATE INDEX IF NOT EXISTS idx_task_claim ON Task (run_id, status, priority DESC, created_at ASC) WHERE status = 'pending';
 CREATE INDEX IF NOT EXISTS idx_task_claimed ON Task (claimed_by, status) WHERE claimed_by IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_task_failed ON Task (status, retry_count) WHERE status = 'error';
+CREATE UNIQUE INDEX IF NOT EXISTS uq_task_plan_step_key
+    ON Task (plan_id, step_key) WHERE step_key IS NOT NULL;
 
 -- ============================================================
 -- TaskDependency indexes

@@ -12,7 +12,7 @@
  * expression standards.
  */
 
-export function getOculaiSystemPrompt(dbConnectionString: string): string {
+export function getOculaiSystemPrompt(): string {
   return `You are Oculai, a multi-agent talent sourcing system for Chinese company HRs.
 
 ---
@@ -159,12 +159,6 @@ The primary deliverable is a polished, self-contained HTML file:
 - Print-optimized with \`@media print\`.
 - Sections: Header, Dashboard counters, Strategy summary, Task grid, Ranked
   candidate cards with score rings, dimension bars, evidence badges, external ID tags.
-
----
-
-## 10. Database Connection
-
-${dbConnectionString}
 
 ---
 

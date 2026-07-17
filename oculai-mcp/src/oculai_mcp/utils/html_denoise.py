@@ -5,8 +5,7 @@ footers, and scripts. Outputs clean Markdown optimized for LLM consumption.
 """
 
 import re
-from typing import Any
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urljoin
 
 try:
     from bs4 import BeautifulSoup, Comment, NavigableString, Tag
@@ -45,11 +44,14 @@ _MIN_CONTENT_LENGTH = 200
 
 def _is_noise_element(tag: Tag) -> bool:
     """Check if a tag is likely noise based on class/id/role attributes."""
-    attrs = " ".join([
-        tag.get("class", ""),
-        tag.get("id", ""),
-        tag.get("role", ""),
-    ]).lower()
+    attr_values: list[str] = []
+    for name in ("class", "id", "role"):
+        value = tag.get(name)
+        if isinstance(value, list):
+            attr_values.extend(str(item) for item in value)
+        elif isinstance(value, str):
+            attr_values.append(value)
+    attrs = " ".join(attr_values).lower()
 
     noise_keywords = [
         "nav", "menu", "sidebar", "side-bar", "footer", "header",
@@ -126,7 +128,8 @@ def _tag_to_markdown(tag: Tag | NavigableString, base_url: str = "") -> str:
     # Process children
     children_md = ""
     for child in tag.children:
-        children_md += _tag_to_markdown(child, base_url)
+        if isinstance(child, (Tag, NavigableString)):
+            children_md += _tag_to_markdown(child, base_url)
 
     # Block-level formatting
     match tag.name:
@@ -182,7 +185,8 @@ def _tag_to_markdown(tag: Tag | NavigableString, base_url: str = "") -> str:
         case "table":
             return _table_to_markdown(tag)
         case "a":
-            href = tag.get("href", "")
+            raw_href = tag.get("href")
+            href = raw_href if isinstance(raw_href, str) else ""
             if href and base_url:
                 href = urljoin(base_url, href)
             text = children_md.strip()
@@ -190,8 +194,10 @@ def _tag_to_markdown(tag: Tag | NavigableString, base_url: str = "") -> str:
                 return f"[{text}]({href})"
             return text
         case "img":
-            src = tag.get("src", "")
-            alt = tag.get("alt", "")
+            raw_src = tag.get("src")
+            raw_alt = tag.get("alt")
+            src = raw_src if isinstance(raw_src, str) else ""
+            alt = raw_alt if isinstance(raw_alt, str) else ""
             if src and base_url:
                 src = urljoin(base_url, src)
             return f"![{alt}]({src})" if src else ""

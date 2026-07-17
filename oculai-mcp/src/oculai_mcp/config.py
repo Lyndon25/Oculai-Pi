@@ -1,8 +1,5 @@
 """Pydantic V2 BaseSettings with mtime-aware cache reload."""
 
-import os
-import time
-from functools import lru_cache
 from pathlib import Path
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -17,7 +14,7 @@ class Settings(BaseSettings):
     db_port: int = 5432
     db_name: str = "oculai"
     db_user: str = "oculai"
-    db_password: str = "oculai_dev"
+    db_password: str = ""
     db_pool_min: int = 1
     db_pool_max: int = 10
 

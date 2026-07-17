@@ -7,13 +7,18 @@ from uuid import UUID, uuid4
 import asyncpg
 
 from oculai_mcp.db import identities, runs
-from oculai_mcp.db.client import execute_with_retry, fetch_with_retry, fetchrow_with_retry, fetchval_with_retry, get_db_pool
+from oculai_mcp.db.client import (
+    execute_with_retry,
+    fetch_with_retry,
+    fetchrow_with_retry,
+    fetchval_with_retry,
+    get_db_pool,
+)
 from oculai_mcp.tools.errors import (
     ConflictError,
     InternalError,
     ValidationError,
 )
-
 
 # ---------------------------------------------------------------------------
 # Person name validation — reject garbage before it enters the database
@@ -280,6 +285,7 @@ async def upsert_candidate(
                     )
         else:
             # Merge data into existing Person
+            assert person_id is not None
             await identities.merge_person_data(person_id, person_data, agent_id)
 
         # Create CandidateRecord with rich extraction metadata
@@ -294,7 +300,8 @@ async def upsert_candidate(
             },
         }
         record_id = await runs.create_candidate_record(
-            run_id, person_id,
+            run_id,
+            person_id,
             raw_data=raw_data,
             created_by_agent=agent_id,
         )

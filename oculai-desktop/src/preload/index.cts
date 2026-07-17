@@ -4,6 +4,8 @@ import type {
   GetCandidatesPayload,
   GetRunStatePayload,
   StartRunPayload,
+  DecideHumanApprovalPayload,
+  RequestReportApprovalPayload,
 } from "../shared/events.js";
 
 const { contextBridge, ipcRenderer } = require("electron") as typeof import("electron");
@@ -30,6 +32,9 @@ const IPC_CHANNELS = {
   GET_CANDIDATES: "action:getCandidates",
   GET_CANDIDATE_DETAIL: "action:getCandidateDetail",
   EXPORT_REPORT: "action:exportReport",
+  DECIDE_HUMAN_APPROVAL: "action:decideHumanApproval",
+  REQUEST_REPORT_APPROVAL: "action:requestReportApproval",
+  LIST_PENDING_APPROVALS: "action:listPendingApprovals",
   LIST_RUNS: "action:listRuns",
   SETTINGS_GET: "settings:get",
   SETTINGS_SET: "settings:set",
@@ -75,6 +80,15 @@ const api = {
 
   exportReport: (payload: ExportReportPayload) =>
     ipcRenderer.invoke(IPC_CHANNELS.EXPORT_REPORT, payload),
+
+  decideHumanApproval: (payload: DecideHumanApprovalPayload) =>
+    ipcRenderer.invoke(IPC_CHANNELS.DECIDE_HUMAN_APPROVAL, payload),
+
+  requestReportApproval: (payload: RequestReportApprovalPayload) =>
+    ipcRenderer.invoke(IPC_CHANNELS.REQUEST_REPORT_APPROVAL, payload),
+
+  listPendingApprovals: (runId: string) =>
+    ipcRenderer.invoke(IPC_CHANNELS.LIST_PENDING_APPROVALS, { runId }),
 
   listRuns: () =>
     ipcRenderer.invoke(IPC_CHANNELS.LIST_RUNS),

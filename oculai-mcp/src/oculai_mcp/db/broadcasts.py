@@ -4,7 +4,7 @@ import logging
 from typing import Any
 from uuid import UUID
 
-from oculai_mcp.db.client import fetch_with_retry, fetchrow_with_retry, execute_with_retry
+from oculai_mcp.db.client import execute_with_retry, fetch_with_retry, fetchrow_with_retry
 
 logger = logging.getLogger(__name__)
 
@@ -33,6 +33,8 @@ async def broadcast_discovery(
         """,
         run_id, discovery_type, content, discovered_by,
     )
+    if row is None:
+        raise RuntimeError("Failed to persist agent broadcast")
     broadcast_id = row["broadcast_id"]
     logger.info("Broadcast %s from %s: %s", broadcast_id, discovered_by, content[:80])
     return broadcast_id

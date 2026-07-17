@@ -9,19 +9,38 @@ breakdowns and evidence counts).
 from typing import Any
 from uuid import UUID
 
+import asyncpg
+
 from oculai_mcp.db.client import fetch_with_retry, fetchrow_with_retry
+from oculai_mcp.tools.errors import ValidationError
+from oculai_mcp.tools.outreach import consume_approved_action
 
 
-async def export_report(run_id: UUID, format: str = "html") -> dict[str, Any]:
+async def export_report(
+    run_id: UUID,
+    format: str = "html",
+    approval_id: UUID | None = None,
+) -> dict[str, Any]:
     """Export a sourcing run report.
 
     Args:
         run_id: The run UUID
         format: "html" (default) or "markdown"
+        approval_id: Approved, single-use ``export_report`` approval UUID
     """
+    if format not in {"html", "markdown"}:
+        raise ValidationError("format must be 'html' or 'markdown'")
     run = await fetchrow_with_retry("SELECT * FROM sourcingrun WHERE run_id = $1", run_id)
     if not run:
         return {"error": "run not found"}
+
+    approval_audit = await consume_approved_action(
+        approval_id=approval_id,
+        run_id=run_id,
+        action_type="export_report",
+        expected_context={"format": format},
+        consumer="report_export",
+    )
 
     # Get plan
     plan = None
@@ -58,7 +77,8 @@ async def export_report(run_id: UUID, format: str = "html") -> dict[str, Any]:
             run_id, c["person_id"],
         )
         evidence_count = await fetchrow_with_retry(
-            "SELECT COUNT(*) as cnt FROM evidence WHERE person_id = $1", c["person_id"],
+            "SELECT COUNT(*) as cnt FROM evidence WHERE run_id = $1 AND person_id = $2",
+            run_id, c["person_id"],
         )
         ev_count = evidence_count["cnt"] if evidence_count else 0
 
@@ -70,16 +90,25 @@ async def export_report(run_id: UUID, format: str = "html") -> dict[str, Any]:
 
         # Evidence details with tier
         ev_rows = await fetch_with_retry(
-            "SELECT tier, source_name, title, confidence, quality_flags FROM evidence WHERE person_id = $1 ORDER BY tier ASC, confidence DESC LIMIT 10",
-            c["person_id"],
+            """SELECT tier, source_name, title, confidence, quality_flags
+               FROM evidence WHERE run_id = $1 AND person_id = $2
+               ORDER BY tier ASC, confidence DESC LIMIT 10""",
+            run_id, c["person_id"],
         )
         evidence_details = [dict(r) for r in ev_rows]
 
         # Score history
-        hist_rows = await fetch_with_retry(
-            "SELECT new_score as score, dimension, changed_at FROM assessmentscorehistory WHERE run_id = $1 AND person_id = $2 ORDER BY changed_at ASC",
-            run_id, c["person_id"],
-        )
+        try:
+            hist_rows = await fetch_with_retry(
+                """SELECT new_score as score, dimension, changed_at
+                   FROM assessmentscorehistory
+                   WHERE run_id = $1 AND person_id = $2 ORDER BY changed_at ASC""",
+                run_id, c["person_id"],
+            )
+        except asyncpg.UndefinedTableError:
+            # Reports remain exportable while an older local database is being
+            # upgraded; the missing optional history is never fabricated.
+            hist_rows = []
         score_history = [{"score": r["score"], "dimension": r["dimension"], "at": str(r["changed_at"])} for r in hist_rows]
 
         candidate_item = {
@@ -127,6 +156,7 @@ async def export_report(run_id: UUID, format: str = "html") -> dict[str, Any]:
         "filtered_candidates": filtered_candidates,
         "filtered_count": len(filtered_candidates),
         "shortlist_cutoff": None,
+        "approval_audit": approval_audit,
     }
 
     if format == "markdown":
@@ -149,21 +179,21 @@ def _render_markdown(report: dict[str, Any]) -> str:
 
     lines = [
         f"# {r['title']}",
-        f"",
+        "",
         f"**状态**: {r['status']} | **创建时间**: {r['created_at']}",
-        f"",
-        f"## 执行概览",
-        f"",
+        "",
+        "## 执行概览",
+        "",
         f"- 候选人总数: {len(candidates)}",
         f"- 已入围: {shortlisted}",
         f"- 平均综合评分: {avg_score:.0f}",
-        f"",
-        f"## 搜索策略",
-        f"",
+        "",
+        "## 搜索策略",
+        "",
         f"{report['plan'].get('strategy_summary', '未记录搜索策略。')}",
-        f"",
-        f"## 任务汇总",
-        f"",
+        "",
+        "## 任务汇总",
+        "",
     ]
     for t in report["task_summary"]:
         lines.append(f"- {t['task_type']}: {t['cnt']} ({t['status']})")
@@ -172,7 +202,7 @@ def _render_markdown(report: dict[str, Any]) -> str:
     for i, c in enumerate(candidates, 1):
         lines.extend([
             f"### {i}. {c['name']} — 综合评分: {c['overall_score']}/100",
-            f"",
+            "",
             f"- **机构**: {c['institution'] or '—'}",
             f"- **H-Index**: {c['h_index']} | **被引次数**: {c['total_citations']} | **论文数**: {c['total_papers']}",
             f"- **状态**: {c['status']} | **证据条目**: {c['evidence_count']}",
@@ -1360,7 +1390,7 @@ def _candidate_card(idx: int, c: dict[str, Any], role_type: str = "default") -> 
     lines.append("</div>")  # close candidate-main
 
     # -- Right: Donut chart --
-    lines.append(f'<div class="candidate-right">')
+    lines.append('<div class="candidate-right">')
     lines.append(f'<div class="donut-chart donut-{score_tier.replace("score-", "")}">')
     lines.append('<svg viewBox="0 0 100 100" width="90" height="90">')
     lines.append('<circle class="donut-bg" cx="50" cy="50" r="40"/>')
@@ -1453,7 +1483,7 @@ def _score_tier(score: float, role_type: str = "default") -> tuple[str, str]:
         return ("score-bad", "bar-bad")
 
 
-def _esc(s: str) -> str:
+def _esc(s: Any) -> str:
     """Minimal HTML escape."""
     return (
         str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")

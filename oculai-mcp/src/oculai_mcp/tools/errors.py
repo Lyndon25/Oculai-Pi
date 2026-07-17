@@ -76,42 +76,13 @@ class OculaiError(Exception):
         super().__init__(message)
         self.message: str = message or self.__class__.__doc__ or ""
         self.details: dict[str, Any] | None = details
-        # Resolve code / status_code: explicit arg > subclass class attr > base default.
-        # Subclasses define ``code`` / ``status_code`` as plain class-level strings/ints.
-        # The @property below reads the instance-level ``_code`` / ``_status_code``
-        # that __init__ sets here.
-        cls = type(self)
-        cls_dict = cls.__dict__
-        resolved_code: str
-        if code is not None:
-            resolved_code = code
-        elif "code" in cls_dict and not isinstance(cls_dict["code"], property):
-            resolved_code = cls_dict["code"]  # type: ignore[assignment]
-        else:
-            resolved_code = "OCULAI_ERROR"
-        resolved_status: int
-        if status_code is not None:
-            resolved_status = status_code
-        elif "status_code" in cls_dict and not isinstance(cls_dict["status_code"], property):
-            resolved_status = cls_dict["status_code"]  # type: ignore[assignment]
-        else:
-            resolved_status = 500
-        object.__setattr__(self, "_code", resolved_code)
-        object.__setattr__(self, "_status_code", resolved_status)
+        # Resolve code/status: explicit argument, then subclass class default.
+        self.code = code if code is not None else type(self).code
+        self.status_code = status_code if status_code is not None else type(self).status_code
 
     # ------------------------------------------------------------------
     # Properties — expose the stored values as read-only attributes.
     # ------------------------------------------------------------------
-
-    @property
-    def code(self) -> str:
-        """Machine-readable error code."""
-        return self._code  # type: ignore[attr-defined]
-
-    @property
-    def status_code(self) -> int:
-        """HTTP-style status code."""
-        return self._status_code  # type: ignore[attr-defined]
 
     # ------------------------------------------------------------------
     # Serialization

@@ -709,6 +709,10 @@
             "type": "string",
             "description": "The run UUID"
           },
+          "approval_id": {
+            "type": "string",
+            "description": "Approved, single-use export_report approval UUID"
+          },
           "format": {
             "type": "string",
             "description": "\"html\" (default) or \"markdown\"",
@@ -716,7 +720,8 @@
           }
         },
         "required": [
-          "run_id"
+          "run_id",
+          "approval_id"
         ]
       }
     },
@@ -827,7 +832,7 @@
             "description": "Type (send_email, send_linkedin_message, etc.)"
           },
           "action_context": {
-            "type": "string",
+            "type": "object",
             "description": "Full context dict describing what, who, and why"
           },
           "draft_content": {
@@ -845,6 +850,42 @@
           "run_id",
           "action_type",
           "action_context"
+        ]
+      }
+    },
+    "oculai_decide_human_approval": {
+      "description": "Approve or deny a pending action as an authorised human reviewer.",
+      "group": "Web Search, Outreach & Browser",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "approval_id": {
+            "type": "string",
+            "description": "The pending approval UUID"
+          },
+          "decision": {
+            "type": "string",
+            "description": "approve or deny"
+          },
+          "reviewer_id": {
+            "type": "string",
+            "description": "Named human reviewer identity"
+          },
+          "reviewer_role": {
+            "type": "string",
+            "description": "Authorised HR/recruiting/compliance role"
+          },
+          "review_notes": {
+            "type": "string",
+            "description": "Required audit rationale"
+          }
+        },
+        "required": [
+          "approval_id",
+          "decision",
+          "reviewer_id",
+          "reviewer_role",
+          "review_notes"
         ]
       }
     },
@@ -1239,10 +1280,15 @@
           "session_id": {
             "type": "string",
             "description": "session_id"
+          },
+          "approval_id": {
+            "type": "string",
+            "description": "Approved, single-use finalize_review approval UUID"
           }
         },
         "required": [
-          "session_id"
+          "session_id",
+          "approval_id"
         ]
       }
     }

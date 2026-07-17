@@ -115,7 +115,11 @@ class CSDNSource(IDataSource):
                 elif "data" in data:
                     inner = data.get("data", {})
                     if isinstance(inner, dict):
-                        items = inner.get("list", inner.get("result_vos", inner.get("items", [])))
+                        nested_items = inner.get(
+                            "list", inner.get("result_vos", inner.get("items", []))
+                        )
+                        if isinstance(nested_items, list):
+                            items = nested_items
                     elif isinstance(inner, list):
                         items = inner
                 elif "list" in data:

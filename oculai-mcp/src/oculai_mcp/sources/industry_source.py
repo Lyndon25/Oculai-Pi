@@ -158,7 +158,7 @@ class IndustrySource(IDataSource):
         public_repos = meta.get("public_repos", 0) or 0
 
         # Composite contribution score (simple unweighted metric)
-        contribution_score = 0
+        contribution_score = 0.0
         if top_repo_stars > 0:
             contribution_score += min(top_repo_stars / 100, 50)  # cap at 50
         if contributions > 0:

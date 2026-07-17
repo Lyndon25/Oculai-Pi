@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+from collections.abc import Callable
 from typing import Any
 
 import asyncpg
@@ -128,9 +129,9 @@ class NotifyListener:
     def __init__(self) -> None:
         self._conn: asyncpg.Connection | None = None
         self._task: asyncio.Task[Any] | None = None
-        self._handlers: dict[str, list[callable]] = {}
+        self._handlers: dict[str, list[Callable[[str], None]]] = {}
 
-    def on(self, channel: str, handler: callable) -> None:
+    def on(self, channel: str, handler: Callable[[str], None]) -> None:
         if channel not in self._handlers:
             self._handlers[channel] = []
         self._handlers[channel].append(handler)

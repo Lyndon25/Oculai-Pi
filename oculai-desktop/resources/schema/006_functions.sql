@@ -15,26 +15,41 @@ CREATE OR REPLACE FUNCTION claim_task_batch(
 RETURNS SETOF Task
 LANGUAGE plpgsql
 AS $$
-DECLARE
-    v_deadline TIMESTAMPTZ;
 BEGIN
-    v_deadline := now() + (p_timeout_min || ' minutes')::INTERVAL;
+    IF p_agent_id IS NULL OR btrim(p_agent_id) = '' THEN
+        RAISE EXCEPTION 'agent_id must not be empty';
+    END IF;
+    IF p_batch_size < 1 THEN
+        RAISE EXCEPTION 'batch_size must be positive';
+    END IF;
+    IF p_timeout_min < 1 THEN
+        RAISE EXCEPTION 'timeout_minutes must be positive';
+    END IF;
 
     RETURN QUERY
     WITH batch AS (
-        SELECT task_id
-        FROM Task
-        WHERE run_id = p_run_id
-          AND task_type = ANY(p_task_types)
-          AND status = 'pending'
-          AND (retry_count < max_retries)
-        ORDER BY priority DESC, created_at ASC
+        SELECT candidate.task_id
+        FROM Task candidate
+        WHERE candidate.run_id = p_run_id
+          AND candidate.task_type = ANY(p_task_types)
+          AND candidate.status = 'pending'
+          AND candidate.retry_count < candidate.max_retries
+          AND NOT EXISTS (
+              SELECT 1
+              FROM TaskDependency dependency
+              JOIN Task prerequisite
+                ON prerequisite.task_id = dependency.depends_on_task_id
+              WHERE dependency.task_id = candidate.task_id
+                AND prerequisite.status <> 'done'
+          )
+        ORDER BY candidate.priority DESC, candidate.created_at ASC
         LIMIT p_batch_size
         FOR UPDATE SKIP LOCKED
     )
     UPDATE Task t
     SET status = 'claimed',
         claimed_by = p_agent_id,
+        agent_id = p_agent_id,
         claimed_at = now(),
         updated_at = now(),
         updated_by_agent = p_agent_id,
@@ -59,7 +74,25 @@ AS $$
 DECLARE
     v_plan_id UUID;
     v_step_key TEXT;
+    v_task RECORD;
 BEGIN
+    SELECT status, claimed_by, agent_id
+    INTO v_task
+    FROM Task
+    WHERE task_id = p_task_id
+    FOR UPDATE;
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'Task % not found', p_task_id;
+    END IF;
+    IF v_task.status NOT IN ('claimed', 'processing') THEN
+        RAISE EXCEPTION 'Task % cannot transition from % to done', p_task_id, v_task.status;
+    END IF;
+    IF v_task.claimed_by IS DISTINCT FROM p_agent_id
+       OR v_task.agent_id IS DISTINCT FROM p_agent_id THEN
+        RAISE EXCEPTION 'Task % is owned by %, not %', p_task_id, v_task.claimed_by, p_agent_id;
+    END IF;
+
     -- Mark task as done
     UPDATE Task
     SET status = 'done',
@@ -70,10 +103,6 @@ BEGIN
         data_version = data_version + 1
     WHERE task_id = p_task_id
     RETURNING plan_id, step_key INTO v_plan_id, v_step_key;
-
-    IF NOT FOUND THEN
-        RAISE EXCEPTION 'Task % not found', p_task_id;
-    END IF;
 
     -- Resolve input references for dependent tasks
     UPDATE Task dep
@@ -138,25 +167,45 @@ CREATE OR REPLACE FUNCTION fail_task(
 RETURNS VOID
 LANGUAGE plpgsql
 AS $$
+DECLARE
+    v_task RECORD;
+    v_next_retry INTEGER;
 BEGIN
+    SELECT status, claimed_by, agent_id, retry_count, max_retries
+    INTO v_task
+    FROM Task
+    WHERE task_id = p_task_id
+    FOR UPDATE;
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'Task % not found', p_task_id;
+    END IF;
+    IF v_task.status NOT IN ('claimed', 'processing') THEN
+        RAISE EXCEPTION 'Task % cannot transition from % to failed', p_task_id, v_task.status;
+    END IF;
+    IF v_task.claimed_by IS DISTINCT FROM p_agent_id
+       OR v_task.agent_id IS DISTINCT FROM p_agent_id THEN
+        RAISE EXCEPTION 'Task % is owned by %, not %', p_task_id, v_task.claimed_by, p_agent_id;
+    END IF;
+
+    v_next_retry := v_task.retry_count + 1;
+
     UPDATE Task
-    SET status = CASE
-            WHEN retry_count >= max_retries THEN 'error'::task_status_t
+        SET status = CASE
+            WHEN v_next_retry >= max_retries THEN 'error'::task_status_t
             ELSE 'pending'::task_status_t
         END,
         error_message = p_error_message,
-        retry_count = retry_count + 1,
+        retry_count = v_next_retry,
         failed_at = now(),
         claimed_by = NULL,
         claimed_at = NULL,
+        agent_id = NULL,
         updated_at = now(),
         updated_by_agent = p_agent_id,
         data_version = data_version + 1
     WHERE task_id = p_task_id;
 
-    IF NOT FOUND THEN
-        RAISE EXCEPTION 'Task % not found', p_task_id;
-    END IF;
 END;
 $$;
 
@@ -175,12 +224,15 @@ BEGIN
     RETURN QUERY
     UPDATE Task t
     SET status = CASE
-            WHEN retry_count >= max_retries THEN 'error'::task_status_t
+            WHEN retry_count + 1 >= max_retries THEN 'error'::task_status_t
             ELSE 'pending'::task_status_t
         END,
         claimed_by = NULL,
         claimed_at = NULL,
+        agent_id = NULL,
         retry_count = retry_count + 1,
+        failed_at = now(),
+        error_message = COALESCE(error_message, 'Task claim expired'),
         updated_at = now(),
         updated_by_agent = 'system::stale_release',
         data_version = data_version + 1

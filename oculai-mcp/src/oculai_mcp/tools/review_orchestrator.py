@@ -14,9 +14,10 @@ when to launch Profile Enricher / Fit Evaluator / Quality Auditor subagents.
 """
 
 from typing import Any
-from uuid import UUID, uuid4
+from uuid import UUID
 
 from oculai_mcp.db.client import execute_with_retry, fetch_with_retry, fetchrow_with_retry
+from oculai_mcp.tools.outreach import consume_approved_action
 
 
 async def create_review_session(
@@ -87,8 +88,6 @@ async def execute_review_pass(
     pass_timings = session.get("pass_timings") or {}
     if isinstance(pass_timings, dict) and session["current_pass"] != pass_type:
         # If advancing to a new pass, record elapsed for previous
-        import time
-        now_ts = time.time()
         # We don't have start timestamps per pass; use a simple incremental approach
         # Store duration_seconds in pass_timings
         pass_timings[session["current_pass"]] = pass_timings.get(session["current_pass"], 0) + 1
@@ -251,16 +250,69 @@ async def apply_audit_adjustments(
     }
 
 
-async def finalize_review_session(session_id: UUID) -> dict[str, Any]:
-    """Mark session complete, compute final rankings, return summary."""
+async def finalize_review_session(
+    session_id: UUID,
+    approval_id: UUID | None = None,
+) -> dict[str, Any]:
+    """Finalize rankings only after deterministic gates and human approval."""
     session = await fetchrow_with_retry(
-        "SELECT run_id, role_type FROM reviewsession WHERE session_id = $1",
+        """SELECT run_id, role_type, status, current_pass, target_candidate_ids
+           FROM reviewsession WHERE session_id = $1""",
         session_id,
     )
     if not session:
         return {"status": "error", "reason": "Review session not found"}
 
     run_id = session["run_id"]
+    if session["status"] != "active" or session["current_pass"] != "complete":
+        return {
+            "status": "error",
+            "reason": "review pipeline must finish all passes before finalization",
+            "current_pass": session["current_pass"],
+        }
+
+    candidate_ids = session.get("target_candidate_ids") or []
+    gate_rows = await fetch_with_retry(
+        """SELECT person_id, match_scores->>'gate_status' AS gate_status,
+                  match_scores->'gate_failures' AS gate_failures
+           FROM candidaterecord
+           WHERE run_id = $1 AND person_id = ANY($2)""",
+        run_id,
+        candidate_ids,
+    )
+    found_ids = {row["person_id"] for row in gate_rows}
+    gate_failures = [
+        {
+            "person_id": str(row["person_id"]),
+            "gate_status": row["gate_status"] or "missing",
+            "gate_failures": row["gate_failures"] or [],
+        }
+        for row in gate_rows
+        if row["gate_status"] != "passed"
+    ]
+    gate_failures.extend(
+        {
+            "person_id": str(person_id),
+            "gate_status": "missing",
+            "gate_failures": [{"reason": "candidate_record_missing"}],
+        }
+        for person_id in candidate_ids
+        if person_id not in found_ids
+    )
+    if gate_failures:
+        return {
+            "status": "error",
+            "reason": "candidate assessment gates must pass before rankings can be finalized",
+            "gate_failures": gate_failures,
+        }
+
+    approval_audit = await consume_approved_action(
+        approval_id=approval_id,
+        run_id=run_id,
+        action_type="finalize_review",
+        expected_context={"session_id": str(session_id)},
+        consumer="review_finalizer",
+    )
 
     # Compute aggregate stats
     stats = await fetchrow_with_retry(
@@ -274,9 +326,10 @@ async def finalize_review_session(session_id: UUID) -> dict[str, Any]:
             COUNT(*) FILTER (WHERE quality_score >= 50 AND quality_score < 80) as good_count,
             COUNT(*) FILTER (WHERE quality_score < 50) as poor_count
         FROM candidaterecord
-        WHERE run_id = $1
+        WHERE run_id = $1 AND person_id = ANY($2)
         """,
         run_id,
+        candidate_ids,
     )
 
     # Score distribution by dimension
@@ -284,25 +337,29 @@ async def finalize_review_session(session_id: UUID) -> dict[str, Any]:
         """
         SELECT dimension, AVG(score) as avg_dim_score, COUNT(*) as count
         FROM candidateassessment
-        WHERE run_id = $1
+        WHERE run_id = $1 AND person_id = ANY($2)
         GROUP BY dimension
         """,
         run_id,
+        candidate_ids,
     )
 
     await execute_with_retry(
         """
         UPDATE reviewsession
-        SET status = 'completed', current_pass = 'complete', completed_at = now(), updated_at = now()
+        SET status = 'completed', current_pass = 'complete', completed_at = now(), updated_at = now(),
+            audit_findings = COALESCE(audit_findings, '{}'::jsonb) || $2
         WHERE session_id = $1
         """,
         session_id,
+        {"human_approval": approval_audit},
     )
 
     return {
         "session_id": str(session_id),
         "status": "completed",
         "run_id": str(run_id),
+        "human_approval": approval_audit,
         "summary": {
             "total_candidates": stats["total_candidates"] if stats else 0,
             "average_score": round(float(stats["avg_score"]) / 10.0, 1) if stats and stats["avg_score"] else 0.0,

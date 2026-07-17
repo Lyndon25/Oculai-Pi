@@ -1,4 +1,4 @@
-"""Oculai Tool Registry — Flat dictionary of all 41 MCP tools.
+"""Oculai Tool Registry — Flat dictionary of all 43 MCP tools.
 
 Extracts every @mcp.tool-decorated async function from server.py into a
 TOOL_REGISTRY dict[str, Callable] where:
@@ -20,16 +20,23 @@ from __future__ import annotations
 from typing import Any, Callable
 from uuid import UUID
 
-from oculai_mcp.db import runs, tasks
-from oculai_mcp.db import iterations as iteration_db
 from oculai_mcp.db import broadcasts as broadcast_db
-from oculai_mcp.tools import candidates, evidence, assessment, sources, report
-from oculai_mcp.tools import web_search, outreach, browser
+from oculai_mcp.db import iterations as iteration_db
+from oculai_mcp.db import runs, tasks
+from oculai_mcp.tools import (
+    assessment,
+    browser,
+    candidates,
+    evidence,
+    firecrawl_scrape,
+    outreach,
+    report,
+    site_crawler,
+    sources,
+    web_search,
+)
 from oculai_mcp.tools import deep_search as deep_search_tool
-from oculai_mcp.tools import site_crawler
 from oculai_mcp.tools import review_orchestrator as review
-from oculai_mcp.tools import firecrawl_scrape
-
 
 # ============================================================================
 # Handler functions — one per tool, each accepting params: dict[str, Any]
@@ -76,49 +83,17 @@ async def _oculai_checkpoint_plan(params: dict[str, Any]) -> dict[str, Any]:
 
     run_uuid = UUID(run_id)
 
-    plan_id = await tasks.create_plan(
+    plan_id, task_count = await tasks.checkpoint_plan(
         run_id=run_uuid,
-        planner_state_json=plan_json,
+        plan_json=plan_json,
         strategy_summary=strategy_summary,
     )
-    await tasks.update_run_active_plan(run_uuid, plan_id)
-    await runs.update_run_status(run_uuid, "running")
-
-    task_list = plan_json.get("tasks", [])
-    created_tasks: dict[str, UUID] = {}
-
-    for t in task_list:
-        task_id = await tasks.create_task(
-            plan_id=plan_id,
-            run_id=run_uuid,
-            task_type=t["task_type"],
-            task_name=t["task_name"],
-            input_data=t.get("input_data", {}),
-            step_key=t.get("step_key"),
-            priority=t.get("priority", 5),
-        )
-        if t.get("step_key"):
-            created_tasks[t["step_key"]] = task_id
-
-    for t in task_list:
-        depends_on = t.get("depends_on", [])
-        if depends_on:
-            task_id = created_tasks.get(t.get("step_key"))
-            if task_id:
-                for dep_step_key in depends_on:
-                    dep_task_id = created_tasks.get(dep_step_key)
-                    if dep_task_id:
-                        await tasks.create_task_dependency(
-                            plan_id=plan_id,
-                            task_id=task_id,
-                            depends_on_task_id=dep_task_id,
-                        )
 
     return {
         "run_id": run_id,
         "plan_id": str(plan_id),
         "status": "active",
-        "task_count": len(task_list),
+        "task_count": task_count,
         "strategy_summary": strategy_summary,
     }
 
@@ -401,7 +376,7 @@ async def _oculai_list_candidates(params: dict[str, Any]) -> dict[str, Any]:
     )
 
 
-async def _oculai_get_candidate(params: dict[str, Any]) -> dict[str, Any]:
+async def _oculai_get_candidate(params: dict[str, Any]) -> dict[str, Any] | None:
     """Handler for oculai_get_candidate."""
     person_id: str = params["person_id"]
     return await candidates.get_candidate(UUID(person_id))
@@ -594,7 +569,11 @@ async def _oculai_apply_audit_adjustments(params: dict[str, Any]) -> dict[str, A
 async def _oculai_finalize_review_session(params: dict[str, Any]) -> dict[str, Any]:
     """Handler for oculai_finalize_review_session."""
     session_id: str = params["session_id"]
-    return await review.finalize_review_session(UUID(session_id))
+    approval_id: str = params["approval_id"]
+    return await review.finalize_review_session(
+        UUID(session_id),
+        approval_id=UUID(approval_id),
+    )
 
 
 # --- Report Tools (1 tool) ---------------------------------------------------
@@ -602,11 +581,13 @@ async def _oculai_finalize_review_session(params: dict[str, Any]) -> dict[str, A
 async def _oculai_export_report(params: dict[str, Any]) -> dict[str, Any]:
     """Handler for oculai_export_report."""
     run_id: str = params["run_id"]
+    approval_id: str = params["approval_id"]
     format: str = params.get("format", "html")
 
     return await report.export_report(
         run_id=UUID(run_id),
         format=format,
+        approval_id=UUID(approval_id),
     )
 
 
@@ -677,6 +658,22 @@ async def _oculai_check_approval_status(params: dict[str, Any]) -> dict[str, Any
     return await outreach.check_approval_status(UUID(approval_id))
 
 
+async def _oculai_decide_human_approval(params: dict[str, Any]) -> dict[str, Any]:
+    """Handler for oculai_decide_human_approval."""
+    approval_id: str = params["approval_id"]
+    decision: str = params["decision"]
+    reviewer_id: str = params["reviewer_id"]
+    reviewer_role: str = params["reviewer_role"]
+    review_notes: str = params["review_notes"]
+    return await outreach.decide_human_approval(
+        approval_id=UUID(approval_id),
+        decision=decision,
+        reviewer_id=reviewer_id,
+        reviewer_role=reviewer_role,
+        review_notes=review_notes,
+    )
+
+
 async def _oculai_list_pending_approvals(params: dict[str, Any]) -> dict[str, Any]:
     """Handler for oculai_list_pending_approvals."""
     run_id: str | None = params.get("run_id")
@@ -715,7 +712,7 @@ async def _oculai_capture_page_evidence(params: dict[str, Any]) -> dict[str, Any
 
 
 # ============================================================================
-# Tool Registry — flat dict of all 41 tools
+# Tool Registry — flat dict of all 43 tools
 # ============================================================================
 
 TOOL_REGISTRY: dict[str, Callable[..., Any]] = {
@@ -769,6 +766,7 @@ TOOL_REGISTRY: dict[str, Callable[..., Any]] = {
     "oculai_search_web": _oculai_search_web,
     "oculai_create_outreach_draft": _oculai_create_outreach_draft,
     "oculai_request_human_approval": _oculai_request_human_approval,
+    "oculai_decide_human_approval": _oculai_decide_human_approval,
     "oculai_check_approval_status": _oculai_check_approval_status,
     "oculai_list_pending_approvals": _oculai_list_pending_approvals,
     "oculai_get_outreach_history": _oculai_get_outreach_history,

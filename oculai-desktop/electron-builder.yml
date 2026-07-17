@@ -18,6 +18,14 @@ extraResources:
     to: pi-windows-x64/
     filter:
       - "**/*"
+  - from: resources/runtime/
+    to: runtime/
+    filter:
+      - "**/*"
+  - from: resources/schema/
+    to: schema/
+    filter:
+      - "**/*"
 
 asar: true
 compression: normal

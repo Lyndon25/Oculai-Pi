@@ -1,361 +1,691 @@
-// @ts-nocheck — Pi SDK API surface has breaking changes in v0.78.x.
-// Runtime compatibility is maintained; type-checking is deferred to SDK upgrade.
-/**
- * Pi Session — creates and manages a Pi AgentSession with Oculai tools.
- *
- * Uses the Pi SDK (createAgentSession) to embed Pi directly in the Electron
- * main process. Registers all 41 Oculai tools as Pi extension tools that
- * delegate to the Python sidecar via ToolBridge.
- *
- * Reference: pi-windows-x64/examples/sdk/12-full-control.ts
- */
+/** Run-isolated Pi AgentSession orchestration with real child AgentSessions. */
 import "./runtime-compat.js";
 import { app } from "electron";
-import { join } from "path";
-import { existsSync, mkdirSync } from "fs";
+import { existsSync, mkdirSync } from "node:fs";
+import { join } from "node:path";
+import { Type, type TSchema } from "typebox";
+import type {
+  AgentSession,
+  AgentSessionEvent,
+  ResourceLoader,
+  ToolDefinition,
+} from "@earendil-works/pi-coding-agent";
 import { getSettingsStore } from "./settings-store.js";
 import { stateBus } from "./state-bus.js";
-import { ToolBridge } from "./tool-bridge.js";
-import { PostgresManager } from "./postgres-manager.js";
+import { type ToolBridge } from "./tool-bridge.js";
 import { getOculaiSystemPrompt } from "../shared/prompts.js";
 import { OCULAI_TOOLS } from "./generated-tools.js";
+import { listAgentProfiles, type AgentProfile } from "./agent-profiles.js";
+import { isAgentToolAllowed } from "./agent-tool-policy.js";
+import {
+  createRunSettingsSnapshot,
+  isSnapshotSourceEnabled,
+  type RunSettingsSnapshot,
+} from "./run-settings.js";
+import { SchedulerRefreshGate } from "./scheduler-refresh-gate.js";
+import {
+  SubagentScheduler,
+  type SubagentRequest,
+  type SubagentResult,
+} from "./subagent-scheduler.js";
 
-let session: any = null;
-let agentDir: string;
-let createExtensionRuntimeImpl: any = null;
+type PiSdk = typeof import("@earendil-works/pi-coding-agent");
 
-async function loadPiRuntime() {
-  const [{ getModel }, sdk] = await Promise.all([
-    import("@earendil-works/pi-ai"),
-    import("@earendil-works/pi-coding-agent"),
-  ]);
-  createExtensionRuntimeImpl = sdk.createExtensionRuntime;
-  return { getModel, ...sdk };
+interface RunExecution {
+  runId: string;
+  agentId: string;
+  state: "starting" | "running" | "aborting";
+  session: AgentSession | null;
+  promise: Promise<void>;
+  settings: RunSettingsSnapshot;
 }
 
-export function getSession() {
-  return session;
+interface SessionContext {
+  runId: string;
+  agentId: string;
+  profile?: AgentProfile;
+  allowSubagents: boolean;
+  settings: RunSettingsSnapshot;
 }
 
-/**
- * Initialize the Pi AgentSession with all Oculai tools registered.
- * Must be called after ToolBridge and PostgresManager are started.
- */
-export async function initPiSession(
-  toolBridge: ToolBridge,
-  postgresManager: PostgresManager,
-): Promise<void> {
-  const {
-    getModel,
-    AuthStorage,
-    createAgentSession,
-    ModelRegistry,
-    SessionManager,
-    SettingsManager,
-  } = await loadPiRuntime();
-  const settings = getSettingsStore();
-  const userData = app.getPath("userData");
-  agentDir = join(userData, "pi-agent");
-  if (!existsSync(agentDir)) {
-    mkdirSync(agentDir, { recursive: true });
+interface RunBudget {
+  tokens: number;
+  turns: number;
+  maxTokens: number;
+  maxTurns: number;
+  exceeded?: string;
+}
+
+async function resolveConfiguredModel(provider: string, modelName: string) {
+  const { getModel } = await import("@earendil-works/pi-ai/compat");
+  // The SDK types enumerate built-in model ids at compile time while Settings
+  // stores the same values dynamically. Keep the cast at this validation edge.
+  const dynamicGetModel = getModel as unknown as (
+    providerName: string,
+    configuredModelName: string,
+  ) => ReturnType<typeof getModel> | undefined;
+  return dynamicGetModel(provider, modelName);
+}
+
+export async function validatePiModel(provider: string, modelName: string): Promise<void> {
+  if (!await resolveConfiguredModel(provider, modelName)) {
+    throw new Error(`Model not found: ${provider}/${modelName}`);
+  }
+}
+
+let sdkPromise: Promise<PiSdk> | null = null;
+let manager: PiSessionManager | null = null;
+
+function loadPiRuntime(): Promise<PiSdk> {
+  sdkPromise ??= import("@earendil-works/pi-coding-agent");
+  return sdkPromise;
+}
+
+function asRecord(value: unknown): Record<string, unknown> {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : {};
+}
+
+function textFromToolResult(value: unknown): Record<string, unknown> {
+  const record = asRecord(value);
+  const content = record.content;
+  if (!Array.isArray(content)) return record;
+  const first = asRecord(content[0]);
+  if (typeof first.text !== "string") return record;
+  try {
+    return JSON.parse(first.text) as Record<string, unknown>;
+  } catch {
+    return { text: first.text };
+  }
+}
+
+export class PiSessionManager {
+  private readonly executions = new Map<string, RunExecution>();
+  private readonly budgets = new Map<string, RunBudget>();
+  private scheduler: SubagentScheduler;
+  private readonly schedulerRefresh = new SchedulerRefreshGate();
+  private disposed = false;
+  private agentDir = "";
+
+  constructor(private readonly bridge: ToolBridge) {
+    this.scheduler = this.createScheduler();
   }
 
-  // ---- Auth & Model ----
-  const authStorage = AuthStorage.create(join(agentDir, "auth.json"));
-
-  // Set API keys from settings
-  const llmProvider = settings.get("llmProvider");
-  const apiKey = settings.getApiKey(llmProvider);
-  if (apiKey) {
-    authStorage.setRuntimeApiKey(llmProvider, apiKey);
+  async initialize(): Promise<void> {
+    const sdk = await loadPiRuntime();
+    const settings = getSettingsStore();
+    const provider = settings.get("llmProvider");
+    const modelName = settings.get("llmModel");
+    await validatePiModel(provider, modelName);
+    if (!settings.getApiKey(provider)) {
+      throw new Error(`No API key configured for provider '${provider}'`);
+    }
+    const userData = app.getPath("userData");
+    this.agentDir = join(userData, "pi-agent");
+    if (!existsSync(this.agentDir)) mkdirSync(this.agentDir, { recursive: true });
+    // Touch the SDK import here so Settings reports "configured" only after
+    // runtime compatibility and all required constructors are actually loaded.
+    void sdk;
   }
 
-  const modelRegistry = ModelRegistry.inMemory(authStorage);
-  const modelName = settings.get("llmModel");
-  const model = getModel(llmProvider, modelName);
-  if (!model) {
-    stateBus.emitSystemLog("error", `Model not found: ${llmProvider}/${modelName}`);
-    throw new Error(`Model not found: ${llmProvider}/${modelName}`);
+  hasActiveRun(runId: string): boolean {
+    return this.executions.has(runId);
   }
 
-  // ---- Settings ----
-  const settingsManager = SettingsManager.inMemory({
-    compaction: { enabled: true },
-    retry: { enabled: true, maxRetries: 3 },
-  });
+  listActiveRuns(): string[] {
+    return Array.from(this.executions.keys());
+  }
 
-// ---- Inline Oculai Subagent Profiles ----
-// These concise role definitions replace the deleted markdown files in
-// oculai/agents/ and oculai-desktop/resources/agents/. They are passed to
-// Pi's ResourceLoader.getAgentsFiles() for subagent discovery.
+  startRun(runId: string, prompt: string): Promise<void> {
+    if (this.disposed) return Promise.reject(new Error("Pi session manager is disposed"));
+    if (this.executions.has(runId)) {
+      return Promise.reject(new Error(`Run '${runId}' is already active`));
+    }
 
-interface AgentFileDef {
-  path: string;
-  content: string;
-}
+    const store = getSettingsStore();
+    const provider = store.get("llmProvider");
+    const settings = createRunSettingsSnapshot({
+      llmProvider: provider,
+      llmModel: store.get("llmModel"),
+      thinkingLevel: store.get("thinkingLevel"),
+      enabledSources: store.get("enabledSources"),
+      maxIterations: store.get("maxIterations"),
+      tokenBudget: store.get("tokenBudget"),
+      concurrency: store.get("concurrency"),
+    }, store.getApiKey(provider) ?? "");
+    const execution: RunExecution = {
+      runId,
+      agentId: `${runId}:orchestrator`,
+      state: "starting",
+      session: null,
+      promise: Promise.resolve(),
+      settings,
+    };
+    this.executions.set(runId, execution); // reserve synchronously: prevents re-entry races
+    this.budgets.set(runId, {
+      tokens: 0,
+      turns: 0,
+      maxTokens: settings.tokenBudget,
+      maxTurns: settings.maxIterations,
+    });
+    execution.promise = this.executeRun(execution, prompt);
+    return execution.promise;
+  }
 
-function getOculaiAgentFiles(): AgentFileDef[] {
-  return [
-    {
-      path: "oculai-search-strategist.md",
-      content: `# Search Strategist
-Analyze a job description and design a multi-source search strategy for Chinese talent sourcing.
+  async abortRun(runId: string): Promise<boolean> {
+    const execution = this.executions.get(runId);
+    if (!execution) return false;
+    execution.state = "aborting";
+    this.scheduler.cancelRun(runId);
+    await execution.session?.abort();
+    try {
+      await execution.promise;
+    } catch {
+      // The owner of startRun receives and persists the terminal state.
+    }
+    return true;
+  }
 
-## Input
-- Job title, JD text, required skills, target domains
+  async dispose(): Promise<void> {
+    this.disposed = true;
+    const runIds = this.listActiveRuns();
+    await Promise.allSettled(runIds.map((runId) => this.abortRun(runId)));
+  }
 
-## Output
-- 2-4 talent profiles (target persona, why they match, initial queries, expected signals)
-- Source hypotheses per profile (at least 2 targeting Tier 1 Chinese platforms: zhihu, juejin, csdn, baidu_qianfan)
-- Query terminology in both Chinese and English
-- Pivot strategies for low-yield searches
+  /** New settings are read for every new session; update concurrency immediately when idle. */
+  refreshSettings(): void {
+    if (!this.schedulerRefresh.request(this.executions.size)) {
+      stateBus.emitSystemLog("info", "Agent settings saved; active runs keep their current model until resumed");
+      return;
+    }
+    this.scheduler = this.createScheduler();
+  }
 
-## Rules
-- At least 50% of hypotheses must be discoverable via Chinese platforms
-- Include Chinese-language query terms alongside English equivalents
-- Target Chinese institutions when proposing Western academic sources`,
-    },
-    {
-      path: "oculai-source-researcher.md",
-      content: `# Source Researcher
-Search a specific data source for candidates matching a given hypothesis. Operate in iterative think-search-refine mode.
+  private createScheduler(): SubagentScheduler {
+    const concurrency = Math.max(1, getSettingsStore().get("concurrency"));
+    return new SubagentScheduler(
+      concurrency,
+      async (context) => this.executeChildSession(context),
+      {
+        spawned: ({ runId, agentId, agent, target }) => {
+          stateBus.emitSubagentSpawned(runId, agentId, agent, target);
+        },
+        progress: ({ runId, agentId, agent, message }) => {
+          stateBus.emitSubagentProgress(runId, agentId, {
+            timestamp: new Date().toISOString(),
+            agentId,
+            agentType: agent,
+            action: "think",
+            message,
+          });
+        },
+        completed: ({ runId, agentId, agent, target, status, output, error }) => {
+          stateBus.emitSubagentCompleted(
+            runId,
+            agentId,
+            agent,
+            target,
+            status,
+            output ? 1 : 0,
+            error,
+          );
+        },
+      },
+    );
+  }
 
-## Available Tools
-- oculai_search_source — search the source with keywords
-- oculai_fetch_source_detail — get detailed profile for a specific entity
-- oculai_record_iteration — log each think/search/classify step
-- oculai_broadcast_discovery — share terminology findings with parallel agents
-
-## Process
-1. THINK: 2-4 sentences on the hypothesis and expected signals
-2. SEARCH: Execute query with Chinese+English terms
-3. OBSERVE: Classify results by type (profile_page/article/web_page/etc.) and confidence
-4. ADJUST: Refine query based on results — discover new terminology, pivot if noisy
-5. VERIFY: Cross-source confirm high-value candidates before upserting
-
-## Rules
-- Max 6 search calls per source to avoid quota exhaustion
-- Prioritize result_type='profile_page' over articles/web_pages
-- Search Chinese platforms with Chinese queries, Western sources with bilingual queries
-- Broadcast discovered terminology via oculai_broadcast_discovery`,
-    },
-    {
-      path: "oculai-query-optimizer.md",
-      content: `# Query Optimizer
-Refine search queries when initial results are noisy, sparse, skewed, or show terminology mismatches.
-
-## When to Invoke
-- High false positive rate (>50% non-person results)
-- Terminology mismatch (HR terms vs. candidate self-descriptions)
-- Population skew (e.g., 80% academics when JD needs industry engineers)
-- Source saturation (same candidates across iterations)
-
-## Process
-1. Review current query performance and result quality
-2. Identify mismatch patterns (wrong result types, wrong populations, wrong terminology)
-3. Propose refined queries with adjusted terminology, signals, and source targeting
-4. Recommend source switches if a source is fundamentally unsuited`,
-    },
-    {
-      path: "oculai-identity-resolver.md",
-      content: `# Identity Resolver
-Merge duplicate candidates across sources and link external identities.
-
-## Process
-1. Cross-reference candidates by external IDs (ORCID, GitHub, DBLP, etc.)
-2. Match by name + institution (ILIKE)
-3. Fuzzy trigram matching for Chinese name variations (simplified/traditional, English variants)
-4. Link confirmed identities via oculai_link_identity
-
-## Rules
-- Handle Chinese name variations: simplified/traditional characters, English transliteration variants
-- Flag conflicts for manual review (conflicting non-NULL values → DataConflict records)
-- Confidence threshold: similarity > 0.7 for automatic linking`,
-    },
-    {
-      path: "oculai-profile-enricher.md",
-      content: `# Profile Enricher
-Deep-dive candidate profiles to gather comprehensive evidence. Chinese platforms first, then Western.
-
-## Available Tools
-- oculai_fetch_source_detail — deep profile lookups on specific platforms
-- oculai_crawl_site — BFS crawl personal homepages, lab pages
-- oculai_firecrawl_scrape — single-page scrape via Firecrawl (keyless)
-- oculai_search_web — web search (firecrawl/tavily/exa)
-- oculai_capture_page_evidence — capture web-based profiles as evidence
-- oculai_attach_evidence — attach findings with auto-assigned quality tier
-
-## Priority Order
-1. Chinese platforms: zhihu, juejin, csdn, baidu_scholar (T2 evidence)
-2. Chinese institution homepages (.edu.cn, lab pages) (T1 evidence)
-3. GitHub repositories with substantive contributions (T1 evidence)
-4. Western academic sources: Semantic Scholar, DBLP, Google Scholar (T2-T3 evidence)
-
-## Rules
-- Every candidate MUST have ≥1 Chinese platform evidence item
-- Flag candidates with china_evidence: missing
-- Record each enrichment cycle via oculai_record_iteration`,
-    },
-    {
-      path: "oculai-fit-evaluator.md",
-      content: `# Fit Evaluator
-Score candidates on multiple assessment dimensions against the JD requirements.
-
-## Process
-1. Create a review session via oculai_create_review_session
-2. Score each candidate on relevant dimensions (academic, engineering, leadership, etc.)
-3. Use role-type appropriate weights from the assessment module
-4. Enforce must-pass gates (skill_match < 4 caps overall score)
-5. All scores MUST reference specific evidence IDs
-
-## Assessment Dimensions
-academic, engineering, leadership, communication, culture_fit, skill_match, location, career_stage, mobility, overall
-
-## Rules
-- Confidence bands: High (0.8-1.0), Medium (0.5-0.8), Low (0.2-0.5), None (<0.2)
-- Include key uncertainties and evidence gaps for each assessment
-- Default location preference: China`,
-    },
-    {
-      path: "oculai-quality-auditor.md",
-      content: `# Quality Auditor
-Audit the final shortlist for quality, compliance, bias, and completeness.
-
-## Audit Dimensions
-1. Chinese candidate coverage — non-Chinese ratio must be <10%
-2. Evidence completeness — high scores (≥80) must have ≥1 T1 evidence
-3. Identity merge accuracy — no duplicates or incorrectly merged candidates
-4. Bias risks — institutional clustering, regional concentration, gender balance
-5. Score consistency — outlier detection across evaluators
-6. Diversity — institution, geography, background distribution
-7. Compliance — data source usage, PII handling
-
-## Actions
-- Apply adjustments via oculai_apply_audit_adjustments
-- Finalize via oculai_finalize_review_session
-- Flag any non-Chinese candidates with justification for the <10% exception rule`,
-    },
-    {
-      path: "oculai-outreach-strategist.md",
-      content: `# Outreach Strategist
-Generate outreach drafts for shortlisted candidates. NEVER send without human approval.
-
-## Process
-1. Review each candidate's profile, evidence, and assessment
-2. Draft personalized outreach in Chinese (use 老师 honorific for senior researchers)
-3. Reference specific evidence (publications, projects, expertise)
-4. Create drafts via oculai_create_outreach_draft
-5. Submit for human approval via oculai_request_human_approval
-
-## Rules
-- NEVER send outreach autonomously — human approval is MANDATORY
-- Default language: Chinese
-- Personalize each message with candidate-specific details
-- Check approval status via oculai_check_approval_status`,
-    },
-  ];
-}
-
-// ---- Pi ResourceLoader ----
-
-const oculaiAgentFiles = getOculaiAgentFiles();
-
-  // ---- Resource Loader (custom for Oculai) ----
-  const systemPrompt = getOculaiSystemPrompt(postgresManager.getConnectionString());
-  const resourceLoader = {
-    getExtensions: () => ({
-      extensions: [],
-      errors: [],
-      runtime: createOculaiExtensionRuntime(toolBridge),
-    }),
-    getSkills: () => ({ skills: [], diagnostics: [] }),
-    getPrompts: () => ({ prompts: [], diagnostics: [] }),
-    getThemes: () => ({ themes: [], diagnostics: [] }),
-    getAgentsFiles: () => ({ agentsFiles: oculaiAgentFiles }),
-    getSystemPrompt: () => systemPrompt,
-    getAppendSystemPrompt: () => [],
-    extendResources: () => {},
-    reload: async () => {},
-  };
-
-  // ---- Create Session ----
-  const result = await createAgentSession({
-    cwd: app.getPath("userData"),
-    agentDir,
-    model,
-    thinkingLevel: settings.get("thinkingLevel"),
-    authStorage,
-    modelRegistry,
-    resourceLoader,
-    tools: [], // We register all tools via the extension runtime
-    sessionManager: SessionManager.create(join(agentDir, "sessions")),
-    settingsManager,
-  });
-
-  session = result.session;
-
-  // ---- Subscribe to agent events → IPC ----
-  session.subscribe((event) => {
-    if (event.type === "message_update") {
-      const msgEvent = event.assistantMessageEvent;
-      if (msgEvent.type === "text_delta") {
-        stateBus.emitMessage(msgEvent.delta);
-      } else if (msgEvent.type === "thinking_delta") {
-        stateBus.emitThinking(msgEvent.delta);
+  private async executeRun(execution: RunExecution, prompt: string): Promise<void> {
+    try {
+      const session = await this.createSession({
+        runId: execution.runId,
+        agentId: execution.agentId,
+        allowSubagents: true,
+        settings: execution.settings,
+      });
+      execution.session = session;
+      if (this.executions.get(execution.runId)?.state === "aborting") {
+        await session.abort();
+        throw this.abortError(`Run '${execution.runId}' was aborted while starting`);
       }
-    } else if (event.type === "tool_execution_start") {
-      const params = event.toolCall.arguments as Record<string, unknown>;
-      stateBus.emitToolCall(
-        event.toolCall.name,
-        params,
+      execution.state = "running";
+      await session.prompt(prompt);
+      this.assertSessionSucceeded(session, `Run '${execution.runId}'`);
+      if (this.executions.get(execution.runId)?.state === "aborting") {
+        throw this.abortError(`Run '${execution.runId}' was aborted`);
+      }
+      const budgetError = this.budgets.get(execution.runId)?.exceeded;
+      if (budgetError) throw new Error(budgetError);
+    } finally {
+      execution.session?.dispose();
+      execution.session = null;
+      this.executions.delete(execution.runId);
+      this.budgets.delete(execution.runId);
+      if (!this.disposed && this.schedulerRefresh.consumeWhenIdle(this.executions.size)) {
+        this.scheduler = this.createScheduler();
+      }
+    }
+  }
+
+  private async executeChildSession(context: {
+    runId: string;
+    agentId: string;
+    profile: AgentProfile;
+    task: string;
+    signal: AbortSignal;
+  }): Promise<string> {
+    const runSettings = this.executions.get(context.runId)?.settings;
+    if (!runSettings) throw this.abortError(`Run '${context.runId}' is no longer active`);
+    const session = await this.createSession({
+      runId: context.runId,
+      agentId: context.agentId,
+      profile: context.profile,
+      allowSubagents: false,
+      settings: runSettings,
+    });
+    let output = "";
+    const unsubscribe = session.subscribe((event) => {
+      if (event.type === "message_update" && event.assistantMessageEvent.type === "text_delta") {
+        output += event.assistantMessageEvent.delta;
+      }
+    });
+    const abort = () => void session.abort();
+    context.signal.addEventListener("abort", abort, { once: true });
+    try {
+      if (context.signal.aborted) throw this.abortError("Subagent was cancelled before start");
+      await session.prompt(
+        `Run ID: ${context.runId}\nAgent ID: ${context.agentId}\n\nDelegated task:\n${context.task}`,
       );
-      emitDashboardSignalForToolStart(event.toolCall.name, params);
-    } else if (event.type === "tool_execution_end") {
-      const result = event.toolResult?.result as Record<string, unknown> | undefined;
-      stateBus.emitToolResult(
-        event.toolCall.name,
-        result || {},
-        event.toolResult?.isError || false,
-      );
-      emitDashboardSignalForToolEnd(
-        event.toolCall.name,
-        event.toolCall.arguments as Record<string, unknown>,
-        result || {},
-        event.toolResult?.isError || false,
+      this.assertSessionSucceeded(session, `Subagent '${context.agentId}'`);
+      if (context.signal.aborted) throw this.abortError("Subagent was cancelled");
+      return output;
+    } finally {
+      context.signal.removeEventListener("abort", abort);
+      unsubscribe();
+      session.dispose();
+    }
+  }
+
+  private async createSession(context: SessionContext): Promise<AgentSession> {
+    const sdk = await loadPiRuntime();
+    const { provider, modelName } = context.settings;
+    const modelRuntime = await sdk.ModelRuntime.create({
+      authPath: join(this.agentDir, "auth.json"),
+      modelsPath: join(this.agentDir, "models.json"),
+    });
+    await modelRuntime.setRuntimeApiKey(provider, context.settings.apiKey);
+    const model = modelRuntime.getModel(provider, modelName)
+      ?? await resolveConfiguredModel(provider, modelName);
+    if (!model) throw new Error(`Model not found: ${provider}/${modelName}`);
+    const settingsManager = sdk.SettingsManager.inMemory({
+      compaction: { enabled: true },
+      retry: { enabled: true, maxRetries: 3 },
+    });
+
+    const systemPrompt = [
+      getOculaiSystemPrompt(),
+      `Current run_id is '${context.runId}'. Current agent_id is '${context.agentId}'.`,
+      "Never access or mutate another run. Tool arguments are runtime-enforced to this run.",
+      context.profile?.systemPrompt,
+    ].filter(Boolean).join("\n\n");
+
+    const resourceLoader: ResourceLoader = {
+      getExtensions: () => ({ extensions: [], errors: [], runtime: sdk.createExtensionRuntime() }),
+      getSkills: () => ({ skills: [], diagnostics: [] }),
+      getPrompts: () => ({ prompts: [], diagnostics: [] }),
+      getThemes: () => ({ themes: [], diagnostics: [] }),
+      getAgentsFiles: () => ({
+        agentsFiles: listAgentProfiles().map((profile) => ({
+          path: `${profile.name}.md`,
+          content: `# ${profile.description}\n\n${profile.systemPrompt}`,
+        })),
+      }),
+      getSystemPrompt: () => systemPrompt,
+      getAppendSystemPrompt: () => [],
+      extendResources: () => undefined,
+      reload: async () => undefined,
+    };
+
+    const customTools = this.createToolDefinitions(context);
+    if (context.allowSubagents) customTools.push(this.createSubagentTool(context.runId));
+    const { session } = await sdk.createAgentSession({
+      cwd: app.getPath("userData"),
+      agentDir: this.agentDir,
+      model,
+      thinkingLevel: context.settings.thinkingLevel,
+      modelRuntime,
+      resourceLoader,
+      customTools,
+      noTools: "builtin",
+      sessionManager: sdk.SessionManager.inMemory(app.getPath("userData")),
+      settingsManager,
+    });
+    this.subscribeToSession(session, context);
+    return session;
+  }
+
+  private createToolDefinitions(context: SessionContext): ToolDefinition[] {
+    return Object.entries(OCULAI_TOOLS)
+      // This governance decision is human-only. Excluding it here is the hard
+      // boundary; the trusted Renderer -> IPC path invokes it directly.
+      .filter(([name]) => isAgentToolAllowed(name))
+      .map(([name, schema]) => ({
+      name,
+      label: name.replace(/^oculai_/, "").replaceAll("_", " "),
+      description: schema.description,
+      parameters: schema.parameters as TSchema,
+      executionMode: PARALLEL_SAFE_TOOLS.has(name) ? "parallel" as const : "sequential" as const,
+      execute: async (
+        _toolCallId: string,
+        rawParams: unknown,
+        signal: AbortSignal | undefined,
+      ) => {
+        try {
+          const params = this.enforceToolContext(name, schema.parameters, asRecord(rawParams), context);
+          const result = await this.bridge.callTool(name, params, { signal });
+          return {
+            content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }],
+            details: undefined,
+          };
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          return {
+            content: [{ type: "text" as const, text: `Error: ${message}` }],
+            isError: true,
+            details: undefined,
+          };
+        }
+      },
+      }));
+  }
+
+  private enforceToolContext(
+    toolName: string,
+    schema: Record<string, unknown>,
+    rawParams: Record<string, unknown>,
+    context: SessionContext,
+  ): Record<string, unknown> {
+    const budgetError = this.budgets.get(context.runId)?.exceeded;
+    if (budgetError) throw new Error(budgetError);
+    const params = Object.fromEntries(
+      Object.entries(rawParams).map(([key, value]) => [key, this.parseStructuredValue(value)]),
+    );
+    const properties = asRecord(schema.properties);
+    if ("run_id" in properties) {
+      if (params.run_id && String(params.run_id) !== context.runId) {
+        throw new Error(`Tool '${toolName}' attempted cross-run access`);
+      }
+      params.run_id = context.runId;
+    }
+    if ("agent_id" in properties) params.agent_id = context.agentId;
+    if ("assessor_agent" in properties) params.assessor_agent = context.agentId;
+
+    const sourceName = typeof params.source_name === "string" ? params.source_name : undefined;
+    if (sourceName && !isSnapshotSourceEnabled(context.settings, sourceName)) {
+      throw new Error(`Data source '${sourceName}' is disabled in Settings`);
+    }
+    const provider = typeof params.provider === "string" ? params.provider : undefined;
+    if (provider && !isSnapshotSourceEnabled(context.settings, provider)) {
+      throw new Error(`Search provider '${provider}' is disabled in Settings`);
+    }
+    if (toolName === "oculai_search_web" && !provider) {
+      const selected = ["exa", "tavily", "firecrawl"]
+        .find((candidate) => isSnapshotSourceEnabled(context.settings, candidate));
+      if (!selected) throw new Error("All web search providers are disabled in Settings");
+      params.provider = selected;
+    }
+    if (toolName === "oculai_deep_search") this.applyDeepSearchSourcePolicy(params, context.settings);
+    return params;
+  }
+
+  private parseStructuredValue(value: unknown): unknown {
+    if (typeof value !== "string") return value;
+    const trimmed = value.trim();
+    if (!(trimmed.startsWith("{") || trimmed.startsWith("["))) return value;
+    try {
+      return JSON.parse(trimmed) as unknown;
+    } catch {
+      return value;
+    }
+  }
+
+  private applyDeepSearchSourcePolicy(
+    params: Record<string, unknown>,
+    settings: RunSettingsSnapshot,
+  ): void {
+    const enabledSources = Object.entries(settings.enabledSources)
+      .filter(([, enabled]) => enabled)
+      .map(([name]) => name);
+    if (enabledSources.length === 0) throw new Error("All data sources are disabled in Settings");
+    const enabled = new Set(enabledSources);
+    const hypotheses = Array.isArray(params.hypotheses)
+      ? params.hypotheses.map((value) => ({ ...asRecord(value) }))
+      : [];
+    for (const hypothesis of hypotheses) {
+      if (Array.isArray(hypothesis.source_priority)) {
+        hypothesis.source_priority = hypothesis.source_priority.filter(
+          (source) => typeof source === "string" && enabled.has(source),
+        );
+      }
+      const initialQueries = asRecord(hypothesis.initial_queries);
+      hypothesis.initial_queries = Object.fromEntries(
+        Object.entries(initialQueries).filter(([source]) => enabled.has(source)),
       );
     }
-  });
+    params.hypotheses = hypotheses;
 
-  stateBus.emitSystemLog("info", `Pi AgentSession initialized with model ${modelName}`);
+    const config = { ...asRecord(params.config) };
+    const requestedBudget = asRecord(config.source_call_budget);
+    config.source_call_budget = Object.fromEntries(
+      enabledSources.map((source) => [source, requestedBudget[source] ?? 30]),
+    );
+    config.max_concurrent_sources = Math.min(
+      typeof config.max_concurrent_sources === "number" ? config.max_concurrent_sources : enabledSources.length,
+      settings.concurrency,
+    );
+    params.config = config;
+  }
+
+  private createSubagentTool(runId: string): ToolDefinition {
+    const task = Type.Object({
+      agent: Type.String(),
+      task: Type.String(),
+      target: Type.Optional(Type.String()),
+    });
+    const parameters = Type.Object({
+      agent: Type.Optional(Type.String()),
+      task: Type.Optional(Type.String()),
+      target: Type.Optional(Type.String()),
+      tasks: Type.Optional(Type.Array(task, { maxItems: 16 })),
+      chain: Type.Optional(Type.Array(task, { maxItems: 16 })),
+    });
+    return {
+      name: "subagent",
+      label: "Subagent",
+      description: "Delegate one task, parallel independent tasks, or a sequential chain to isolated Oculai AgentSessions.",
+      parameters,
+      executionMode: "parallel",
+      execute: async (_toolCallId, params, signal) => {
+        try {
+          const results = await this.scheduler.execute(runId, params as SubagentRequest, signal);
+          return {
+            content: [{ type: "text", text: JSON.stringify(results, null, 2) }],
+            details: { results } satisfies { results: SubagentResult[] },
+          };
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          return {
+            content: [{ type: "text", text: `Subagent error: ${message}` }],
+            isError: true,
+            details: undefined,
+          };
+        }
+      },
+    };
+  }
+
+  private subscribeToSession(session: AgentSession, context: SessionContext): void {
+    session.subscribe((event: AgentSessionEvent) => {
+      if (event.type === "message_update") {
+        const message = event.assistantMessageEvent;
+        if (message.type === "text_delta") {
+          stateBus.emitMessage(context.runId, context.agentId, message.delta);
+        } else if (message.type === "thinking_delta") {
+          stateBus.emitThinking(context.runId, context.agentId, message.delta);
+        }
+      } else if (event.type === "tool_execution_start") {
+        const params = asRecord(event.args);
+        stateBus.emitToolCall(context.runId, context.agentId, event.toolName, params);
+        this.emitToolStart(context, event.toolName, params);
+      } else if (event.type === "tool_execution_end") {
+        const result = textFromToolResult(event.result);
+        stateBus.emitToolResult(context.runId, context.agentId, event.toolName, result, event.isError);
+        this.emitToolEnd(context, event.toolName, asRecord(event.result), result, event.isError);
+      } else if (event.type === "turn_end") {
+        const budget = this.budgets.get(context.runId);
+        if (budget) {
+          budget.turns += 1;
+          if (budget.turns > budget.maxTurns) {
+            this.exceedBudget(context.runId, `Run exceeded maxIterations (${budget.maxTurns})`);
+          }
+        }
+      } else if (event.type === "message_end") {
+        const message = asRecord(event.message);
+        if (message.role !== "assistant") return;
+        const usage = asRecord(message.usage);
+        const input = typeof usage.input === "number" ? usage.input : 0;
+        const output = typeof usage.output === "number" ? usage.output : 0;
+        const budget = this.budgets.get(context.runId);
+        if (budget) {
+          budget.tokens += input + output;
+          if (budget.tokens > budget.maxTokens) {
+            this.exceedBudget(context.runId, `Run exceeded tokenBudget (${budget.maxTokens})`);
+          }
+        }
+      }
+    });
+  }
+
+  private exceedBudget(runId: string, reason: string): void {
+    const budget = this.budgets.get(runId);
+    if (!budget || budget.exceeded) return;
+    budget.exceeded = reason;
+    stateBus.emitRunError(runId, reason, "budget");
+    this.scheduler.cancelRun(runId);
+    void this.executions.get(runId)?.session?.abort();
+  }
+
+  private emitToolStart(context: SessionContext, name: string, params: Record<string, unknown>): void {
+    const phase = TOOL_PHASES[name];
+    if (phase) stateBus.emitPhaseChange(context.runId, phase);
+    const action = TOOL_ACTIONS[name];
+    if (!action) return;
+    stateBus.emitSubagentProgress(context.runId, context.agentId, {
+      timestamp: new Date().toISOString(),
+      agentId: context.agentId,
+      agentType: context.profile?.description ?? "Orchestrator",
+      action,
+      message: `Started ${name.replace(/^oculai_/, "").replaceAll("_", " ")}`,
+      detail: typeof params.source_name === "string" ? params.source_name : undefined,
+    });
+  }
+
+  private emitToolEnd(
+    context: SessionContext,
+    name: string,
+    params: Record<string, unknown>,
+    result: Record<string, unknown>,
+    isError: boolean,
+  ): void {
+    const action = isError ? "error" : TOOL_ACTIONS[name];
+    if (action) {
+      stateBus.emitSubagentProgress(context.runId, context.agentId, {
+        timestamp: new Date().toISOString(),
+        agentId: context.agentId,
+        agentType: context.profile?.description ?? "Orchestrator",
+        action,
+        message: isError ? `${name} failed` : `${name} completed`,
+      });
+    }
+    if (!isError && name === "oculai_upsert_candidate") {
+      const personData = asRecord(params.person_data);
+      const personId = String(result.person_id ?? "");
+      if (personId) {
+        stateBus.emitCandidateUpserted(
+          context.runId,
+          personId,
+          String(personData.name ?? result.name ?? "Unknown candidate"),
+          typeof personData.institution === "string" ? personData.institution : undefined,
+          typeof params.source_name === "string" ? params.source_name : undefined,
+        );
+      }
+    }
+  }
+
+  private abortError(message: string): Error {
+    const error = new Error(message);
+    error.name = "AbortError";
+    return error;
+  }
+
+  private assertSessionSucceeded(session: AgentSession, label: string): void {
+    let assistant: Record<string, unknown> | null = null;
+    for (let index = session.messages.length - 1; index >= 0; index -= 1) {
+      const message = asRecord(session.messages[index]);
+      if (message.role === "assistant") {
+        assistant = message;
+        break;
+      }
+    }
+    if (!assistant) throw new Error(`${label} ended without an assistant response`);
+
+    const stopReason = String(assistant.stopReason ?? "");
+    const detail = typeof assistant.errorMessage === "string" && assistant.errorMessage.trim()
+      ? `: ${assistant.errorMessage}`
+      : "";
+    if (stopReason === "aborted") throw this.abortError(`${label} was aborted${detail}`);
+    if (stopReason === "error") throw new Error(`${label} model response failed${detail}`);
+    if (stopReason === "length") throw new Error(`${label} stopped at the model output limit${detail}`);
+  }
 }
 
-const TOOL_PHASES: Record<string, string> = {
+const TOOL_PHASES: Record<string, Parameters<typeof stateBus.emitPhaseChange>[1]> = {
   oculai_create_run: "init",
   oculai_list_source_capabilities: "strategy",
   oculai_checkpoint_plan: "strategy",
   oculai_search_source: "searching",
-  oculai_fetch_source_detail: "searching",
   oculai_deep_search: "searching",
-  oculai_upsert_candidate: "searching",
-  oculai_upsert_candidates_batch: "searching",
   oculai_link_identity: "identity_resolution",
   oculai_get_candidate: "enrichment",
-  oculai_capture_page_evidence: "enrichment",
   oculai_attach_evidence: "enrichment",
-  oculai_get_evidence: "enrichment",
   oculai_record_assessment: "evaluation",
   oculai_score_candidate: "evaluation",
   oculai_create_review_session: "audit",
   oculai_finalize_review_session: "shortlist",
   oculai_export_report: "complete",
-  oculai_create_outreach_draft: "outreach",
-  oculai_request_human_approval: "outreach",
 };
 
-const TOOL_ACTIONS: Record<string, string> = {
+const PARALLEL_SAFE_TOOLS: ReadonlySet<string> = new Set([
+  "oculai_search_source",
+  "oculai_fetch_source_detail",
+  "oculai_search_web",
+  "oculai_firecrawl_scrape",
+  "oculai_crawl_site",
+  "oculai_get_candidate",
+  "oculai_get_evidence",
+  "oculai_get_evidence_by_tier",
+  "oculai_get_run_state",
+  "oculai_get_search_progress",
+  "oculai_get_review_progress",
+  "oculai_get_broadcasts",
+  "oculai_list_source_capabilities",
+  "oculai_check_approval_status",
+  "oculai_list_pending_approvals",
+]);
+
+const TOOL_ACTIONS: Record<string, Parameters<typeof stateBus.emitSubagentProgress>[2]["action"]> = {
   oculai_record_iteration: "think",
   oculai_search_source: "search",
-  oculai_fetch_source_detail: "search",
   oculai_deep_search: "search",
   oculai_broadcast_discovery: "broadcast",
   oculai_upsert_candidate: "upsert",
@@ -368,138 +698,20 @@ const TOOL_ACTIONS: Record<string, string> = {
   oculai_export_report: "export",
 };
 
-function getRunId(params: Record<string, unknown>, result?: Record<string, unknown>): string | null {
-  const value = params.run_id ?? params.runId ?? result?.run_id ?? result?.runId;
-  return value ? String(value) : null;
+export async function initPiSession(bridge: ToolBridge): Promise<void> {
+  if (manager) await manager.dispose();
+  const next = new PiSessionManager(bridge);
+  await next.initialize();
+  manager = next;
+  stateBus.emitSystemLog("info", "Pi multi-session runtime initialized");
 }
 
-function parseToolResult(result: Record<string, unknown>): Record<string, unknown> {
-  const content = result?.content;
-  if (Array.isArray(content)) {
-    const first = content[0] as { text?: unknown } | undefined;
-    if (typeof first?.text === "string") {
-      try {
-        return JSON.parse(first.text) as Record<string, unknown>;
-      } catch {
-        return result;
-      }
-    }
-  }
-  return result;
+export function getPiSessionManager(): PiSessionManager | null {
+  return manager;
 }
 
-function toolLabel(name: string): string {
-  return name.replace(/^oculai_/, "").replace(/_/g, " ");
-}
-
-function emitDashboardSignalForToolStart(name: string, params: Record<string, unknown>): void {
-  const runId = getRunId(params);
-  const phase = TOOL_PHASES[name];
-  if (runId && phase) {
-    stateBus.emitPhaseChange(runId, phase as never);
-  }
-
-  const action = TOOL_ACTIONS[name];
-  if (runId && action) {
-    stateBus.emitSubagentProgress(`tool:${name}`, {
-      timestamp: new Date().toISOString(),
-      agentId: `tool:${name}`,
-      agentType: "Oculai Tool",
-      action: action as never,
-      message: `开始执行 ${toolLabel(name)}`,
-      detail: typeof params.source_name === "string" ? params.source_name : undefined,
-    });
-  }
-}
-
-function emitDashboardSignalForToolEnd(
-  name: string,
-  params: Record<string, unknown>,
-  rawResult: Record<string, unknown>,
-  isError: boolean,
-): void {
-  const result = parseToolResult(rawResult);
-  const runId = getRunId(params, result);
-  const action = isError ? "error" : TOOL_ACTIONS[name];
-
-  if (runId && action) {
-    stateBus.emitSubagentProgress(`tool:${name}`, {
-      timestamp: new Date().toISOString(),
-      agentId: `tool:${name}`,
-      agentType: "Oculai Tool",
-      action: action as never,
-      message: isError ? `${toolLabel(name)} 执行失败` : `${toolLabel(name)} 执行完成`,
-      detail: isError ? "查看 Logs" : undefined,
-    });
-  }
-
-  if (!isError && name === "oculai_upsert_candidate") {
-    const personData = (params.person_data || {}) as Record<string, unknown>;
-    const personId = String(result.person_id || "");
-    if (personId) {
-      stateBus.emitCandidateUpserted(
-        personId,
-        String(personData.name || result.name || "Unknown candidate"),
-        typeof personData.institution === "string" ? personData.institution : undefined,
-        typeof params.source_name === "string" ? params.source_name : undefined,
-      );
-    }
-  }
-
-  if (!isError && name === "oculai_upsert_candidates_batch" && Array.isArray(result.accepted)) {
-    for (const accepted of result.accepted as Array<Record<string, unknown>>) {
-      const personId = String(accepted.person_id || "");
-      if (!personId) continue;
-      stateBus.emitCandidateUpserted(
-        personId,
-        String(accepted.name || "Unknown candidate"),
-        undefined,
-        typeof params.source_name === "string" ? params.source_name : undefined,
-      );
-    }
-  }
-}
-
-/**
- * Create a Pi extension runtime that registers all Oculai tools.
- * Each tool delegates to the Python sidecar via ToolBridge.
- */
-function createOculaiExtensionRuntime(bridge: ToolBridge) {
-  if (!createExtensionRuntimeImpl) {
-    throw new Error("Pi extension runtime is not loaded");
-  }
-  const runtime = createExtensionRuntimeImpl();
-
-  // Register all 41 Oculai tools
-  for (const [name, schema] of Object.entries(OCULAI_TOOLS)) {
-    runtime.registerTool({
-      name,
-      description: schema.description,
-      parameters: schema.parameters,
-      async execute(_toolCallId, params) {
-        try {
-          stateBus.emitSystemLog("debug", `Tool call: ${name}`);
-          const result = await bridge.callTool(name, params as Record<string, unknown>);
-          return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
-        } catch (err) {
-          const msg = err instanceof Error ? err.message : String(err);
-          stateBus.emitSystemLog("error", `Tool '${name}' failed: ${msg}`);
-          return {
-            content: [{ type: "text", text: `Error: ${msg}` }],
-            isError: true,
-          };
-        }
-      },
-    });
-  }
-
-  return runtime;
-}
-
-/** Dispose of the Pi session. */
-export function disposeSession(): void {
-  if (session) {
-    session.dispose();
-    session = null;
-  }
+export async function disposeSession(): Promise<void> {
+  const current = manager;
+  manager = null;
+  await current?.dispose();
 }

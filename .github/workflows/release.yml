@@ -12,7 +12,7 @@ permissions:
 jobs:
   build-and-release:
     name: "Build Installer & Draft Release"
-    runs-on: windows-latest
+    runs-on: windows-2025
 
     steps:
       - name: Checkout (with LFS)
@@ -24,12 +24,12 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          node-version: "24"
 
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: "3.12"
 
       - name: Verify tag matches package.json version
         if: startsWith(github.ref, 'refs/tags/')
@@ -45,19 +45,95 @@ jobs:
             exit 1
           fi
 
+      - name: Install locked Python packaging runtime
+        shell: pwsh
+        run: |
+          python -m venv .runtime-venv
+          .\.runtime-venv\Scripts\python.exe -m pip install --disable-pip-version-check -r oculai-mcp\requirements-runtime.lock
+
+      - name: Install pinned PostgreSQL runtime
+        shell: pwsh
+        run: |
+          $postgresHome = "C:\Program Files\PostgreSQL\18"
+          if (-not (Test-Path -LiteralPath "$postgresHome\bin\postgres.exe")) {
+            winget install --id PostgreSQL.PostgreSQL.18 --version 18.4-1 --exact --silent `
+              --accept-package-agreements --accept-source-agreements --disable-interactivity
+          }
+          if (-not (Test-Path -LiteralPath "$postgresHome\bin\postgres.exe")) {
+            throw "PostgreSQL 18.4 was not installed at $postgresHome"
+          }
+
+      - name: Build pinned pgvector for PostgreSQL 18
+        shell: pwsh
+        run: |
+          $postgresHome = "C:\Program Files\PostgreSQL\18"
+          $source = Join-Path $env:RUNNER_TEMP "pgvector-0.8.2"
+          git clone --branch v0.8.2 --depth 1 https://github.com/pgvector/pgvector.git $source
+          $expectedCommit = "cab9da72c04353f143bb06b42ab70a403daac64a"
+          $actualCommit = git -C $source rev-parse HEAD
+          if ($actualCommit -ne $expectedCommit) {
+            throw "pgvector v0.8.2 resolved to $actualCommit, expected $expectedCommit"
+          }
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vsRoot = & $vswhere -latest -products * `
+            -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (-not $vsRoot) { throw "Visual Studio x64 C++ build tools were not found" }
+          $vcvars = Join-Path $vsRoot "VC\Auxiliary\Build\vcvars64.bat"
+          $command = "call `"$vcvars`" && set `"PGROOT=$postgresHome`" && cd /d `"$source`" && nmake /F Makefile.win && nmake /F Makefile.win install"
+          cmd.exe /d /s /c $command
+          if ($LASTEXITCODE -ne 0) { throw "pgvector v0.8.2 build failed" }
+
+      - name: Prepare and verify self-contained Windows runtime
+        shell: pwsh
+        run: |
+          .\scripts\prepare_windows_runtime.ps1 `
+            -PostgresHome "C:\Program Files\PostgreSQL\18" `
+            -Python ".\.runtime-venv\Scripts\python.exe"
+
       - name: Install desktop dependencies
         run: |
           cd oculai-desktop
           npm ci
 
-      - name: Build installer & publish draft release
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        shell: bash
+      - name: Audit desktop dependencies
         run: |
           cd oculai-desktop
-          npm run build -- --publish always
+          npm audit --omit=dev --audit-level=moderate
+          npm audit --audit-level=moderate
+
+      - name: Build validated installer
+        shell: pwsh
+        run: |
+          Push-Location oculai-desktop
+          npm run build -- --publish never
+          Pop-Location
+          python scripts\verify_installer_contents.py --app oculai-desktop\dist-electron\win-unpacked
+
+      - name: Smoke packaged desktop lifecycle
+        shell: pwsh
+        run: |
+          .\scripts\smoke_packaged_app.ps1 `
+            -App "oculai-desktop\dist-electron\win-unpacked"
+          .\scripts\smoke_packaged_app.ps1 `
+            -App "oculai-desktop\dist-electron\win-unpacked" `
+            -CloseDuringStartup
+
+      - name: Publish validated draft release
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}"
+          gh release view $tag *> $null
+          if ($LASTEXITCODE -ne 0) {
+            gh release create $tag --draft --verify-tag --title "Oculai $tag" --generate-notes
+          }
+          $artifacts = Get-ChildItem oculai-desktop\dist-electron -File |
+            Where-Object { $_.Name -match '\.(exe|blockmap)$' -or $_.Name -eq 'latest.yml' } |
+            ForEach-Object { $_.FullName }
+          if (-not $artifacts) { throw "No validated release artifacts were produced" }
+          gh release upload $tag @artifacts --clobber
 
       - name: Upload installer artifact (fallback)
         if: always()

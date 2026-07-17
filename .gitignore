@@ -70,3 +70,7 @@ pi-windows-x64/node_modules/
 # Desktop app — dependencies and build artifacts (not committed)
 oculai-desktop/node_modules/
 oculai-desktop/dist-electron/
+
+# Generated distributable runtimes (created by scripts/prepare_windows_runtime.ps1)
+oculai-desktop/resources/runtime/
+work/

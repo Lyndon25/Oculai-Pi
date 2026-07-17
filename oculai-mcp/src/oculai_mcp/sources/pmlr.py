@@ -80,7 +80,7 @@ class PMLRSource(IDataSource):
 
     def __init__(self) -> None:
         self._client: httpx.AsyncClient | None = None
-        self._volume_cache: dict[str, dict[str, Any]] | None = None
+        self._volume_cache: dict[str, list[dict[str, Any]]] | None = None
 
     async def _get_client(self) -> httpx.AsyncClient:
         if self._client is None:
@@ -198,7 +198,8 @@ class PMLRSource(IDataSource):
 
         # PMLR lists proceedings as links like /v235/ with a title
         for link in soup.find_all("a", href=True):
-            href = link.get("href", "")
+            raw_href = link.get("href")
+            href = raw_href if isinstance(raw_href, str) else ""
             match = re.match(r"/v(\d+)/$", href)
             if not match:
                 continue
@@ -337,7 +338,9 @@ class PMLRSource(IDataSource):
                 a = title_link.find("a", href=True)
                 if a:
                     title = a.get_text(strip=True)
-                    paper_url = urljoin(PMLR_BASE, a.get("href", ""))
+                    raw_href = a.get("href")
+                    href = raw_href if isinstance(raw_href, str) else ""
+                    paper_url = urljoin(PMLR_BASE, href)
 
             authors: list[str] = []
             authors_p = paper_div.find("p", class_="details")

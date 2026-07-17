@@ -275,7 +275,8 @@ class ACLAnthologySource(IDataSource):
             if not link:
                 continue
 
-            href = link.get("href", "").strip("/")
+            raw_href = link.get("href")
+            href = raw_href.strip("/") if isinstance(raw_href, str) else ""
             title = link.get_text(strip=True)
             if not href or not title:
                 continue
@@ -328,7 +329,8 @@ class ACLAnthologySource(IDataSource):
             if not link:
                 continue
 
-            href = link.get("href", "").strip("/")
+            raw_href = link.get("href")
+            href = raw_href.strip("/") if isinstance(raw_href, str) else ""
             title = link.get_text(strip=True)
             if not href or not title:
                 continue

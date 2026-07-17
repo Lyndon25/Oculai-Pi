@@ -51,12 +51,13 @@ async def search_web(
     settings = get_settings()
     start = time.monotonic()
 
+    api_key: str | None
     if provider == "tavily":
-        api_key = getattr(settings, "tavily_api_key", None)
+        api_key = settings.tavily_api_key
     elif provider == "exa":
-        api_key = getattr(settings, "exa_api_key", None)
+        api_key = settings.exa_api_key
     elif provider == "firecrawl":
-        api_key = getattr(settings, "firecrawl_api_key", None)
+        api_key = settings.firecrawl_api_key
         # Firecrawl works keyless — api_key is optional for higher rate limits
     else:
         return {"status": "error", "error": {"code": "unknown_provider", "message": f"Provider '{provider}' not supported. Use 'tavily', 'exa', or 'firecrawl'."}}
@@ -75,8 +76,10 @@ async def search_web(
 
     try:
         if provider == "tavily":
+            assert api_key is not None
             results = await _search_tavily(api_key, query, limit, include_domains, exclude_domains)
         elif provider == "exa":
+            assert api_key is not None
             results = await _search_exa(api_key, query, limit, include_domains, exclude_domains)
         else:
             results = await _search_firecrawl(query, limit, include_domains, exclude_domains)

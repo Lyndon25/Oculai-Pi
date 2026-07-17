@@ -191,6 +191,22 @@ export const OCULAI_TOOLS: Record<
     },
   },
 
+  // Web Search, Outreach & Browser
+  oculai_decide_human_approval: {
+    description: "Approve or deny a pending action as an authorised human reviewer.",
+    parameters: {
+      type: "object",
+      properties: {
+        approval_id: { type: "string" },
+        decision: { type: "string" },
+        reviewer_id: { type: "string" },
+        reviewer_role: { type: "string" },
+        review_notes: { type: "string" }
+      },
+      required: ["approval_id", "decision", "reviewer_id", "reviewer_role", "review_notes"],
+    },
+  },
+
   // Source Tools
   oculai_deep_search: {
     description: "Execute deep iterative search across hypotheses and sources.",
@@ -226,9 +242,10 @@ export const OCULAI_TOOLS: Record<
       type: "object",
       properties: {
         run_id: { type: "string" },
+        approval_id: { type: "string" },
         format: { type: "string" }
       },
-      required: ["run_id"],
+      required: ["run_id", "approval_id"],
     },
   },
 
@@ -265,9 +282,10 @@ export const OCULAI_TOOLS: Record<
     parameters: {
       type: "object",
       properties: {
-        session_id: { type: "string" }
+        session_id: { type: "string" },
+        approval_id: { type: "string" }
       },
-      required: ["session_id"],
+      required: ["session_id", "approval_id"],
     },
   },
 
@@ -531,7 +549,7 @@ export const OCULAI_TOOLS: Record<
       properties: {
         run_id: { type: "string" },
         action_type: { type: "string" },
-        action_context: { type: "string" },
+        action_context: { type: "object" },
         draft_content: { type: "string" },
         agent_id: { type: "string" }
       },

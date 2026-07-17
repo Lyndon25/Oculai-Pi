@@ -5,12 +5,12 @@ Tests the critical path: create_run → plan → tasks → candidates → eviden
 assessment → review → report → errors → registry.
 
 Usage:
-    DB_HOST=localhost DB_PORT=5432 DB_USER=oculai DB_PASSWORD=oculai_dev DB_NAME=oculai pytest tests/test_e2e_smoke.py -v
+    DB_HOST=localhost DB_PORT=5432 DB_USER=oculai DB_PASSWORD=<password> DB_NAME=oculai pytest tests/test_e2e_smoke.py -v
 """
 
 import os
 import sys
-from uuid import UUID, uuid4
+from uuid import UUID
 
 import pytest
 
@@ -95,7 +95,7 @@ async def test_list_runs(run_id):
 
 async def test_checkpoint_plan(run_id, agent_id):
     """Test plan creation with a DAG of tasks."""
-    from oculai_mcp.db import tasks, runs
+    from oculai_mcp.db import runs, tasks
 
     plan_json = {
         "strategy": "Multi-source search for ML inference engineers",
@@ -210,12 +210,16 @@ async def test_claim_and_complete_tasks(run_id, agent_id):
 
 async def test_upsert_and_list_candidates(run_id, agent_id):
     """Test candidate upsert with identity resolution and listing."""
-    from oculai_mcp.tools.candidates import upsert_candidate, list_candidates, get_candidate
+    from oculai_mcp.tools.candidates import get_candidate, list_candidates, upsert_candidate
 
     candidates_data = [
         {"name": "Zhang Wei", "institution": "Tsinghua University", "orcid": "0000-0001-1234-5678"},
         {"name": "Li Ming", "institution": "ByteDance", "github_id": "liming-ml"},
-        {"name": "Wang Fang", "institution": "Peking University", "google_scholar_id": "wf_scholar_1"},
+        {
+            "name": "Wang Fang",
+            "institution": "Peking University",
+            "google_scholar_id": "wf_scholar_1",
+        },
     ]
 
     person_ids = []
@@ -278,11 +282,11 @@ async def test_attach_and_get_evidence(run_id, agent_id):
         confidence=0.95,
         metadata={"discovery_cycle": 1, "cross_source_verified": True},
     )
-    assert "evidence_id" in ev, f"attach_evidence should return evidence_id"
+    assert "evidence_id" in ev, "attach_evidence should return evidence_id"
 
     # Retrieve evidence
     evidence_list = await get_evidence(person_id)
-    assert evidence_list["total"] >= 1, f"Expected >=1 evidence items"
+    assert evidence_list["total"] >= 1, "Expected >=1 evidence items"
 
 
 # ============================================================================
@@ -292,16 +296,31 @@ async def test_attach_and_get_evidence(run_id, agent_id):
 
 async def test_score_and_shortlist(run_id, agent_id):
     """Test candidate scoring."""
+    from oculai_mcp.tools.assessment import get_shortlist, score_candidate
     from oculai_mcp.tools.candidates import upsert_candidate
-    from oculai_mcp.tools.assessment import score_candidate, get_shortlist
+    from oculai_mcp.tools.evidence import attach_evidence
 
     # Create fresh candidates for scoring
     pids = []
-    for i, (name, inst, scores) in enumerate([
-        ("Alpha Tester", "Shanghai AI Lab", {"academic": 9.0, "engineering": 8.5, "skill_match": 9.0}),
-        ("Beta Tester", "Alibaba DAMO", {"academic": 7.5, "engineering": 9.0, "skill_match": 8.0}),
-        ("Gamma Tester", "Huawei Noah", {"academic": 8.0, "engineering": 8.0, "skill_match": 7.5}),
-    ]):
+    for i, (name, inst, scores) in enumerate(
+        [
+            (
+                "Alpha Tester",
+                "Shanghai AI Lab",
+                {"academic": 9.0, "engineering": 8.5, "skill_match": 9.0},
+            ),
+            (
+                "Beta Tester",
+                "Alibaba DAMO",
+                {"academic": 7.5, "engineering": 9.0, "skill_match": 8.0},
+            ),
+            (
+                "Gamma Tester",
+                "Huawei Noah",
+                {"academic": 8.0, "engineering": 8.0, "skill_match": 7.5},
+            ),
+        ]
+    ):
         result = await upsert_candidate(
             run_id=run_id,
             person_data={"name": name, "institution": inst},
@@ -311,11 +330,29 @@ async def test_score_and_shortlist(run_id, agent_id):
         pid = UUID(result["person_id"])
         pids.append(pid)
 
+        paper = await attach_evidence(
+            person_id=pid,
+            run_id=run_id,
+            evidence_type="paper",
+            title=f"Verified paper for {name}",
+            source_name="semantic_scholar",
+            captured_by_agent=agent_id,
+        )
+        code = await attach_evidence(
+            person_id=pid,
+            run_id=run_id,
+            evidence_type="code",
+            title=f"Verified repository contribution for {name}",
+            source_name="github",
+            captured_by_agent=agent_id,
+        )
+
         scored = await score_candidate(
             run_id=run_id,
             person_id=pid,
             dimensions=scores,
             assessor_agent=agent_id,
+            evidence_ids=[paper["evidence_id"], code["evidence_id"]],
             role_type="ml_engineer",
         )
         assert scored is not None
@@ -330,40 +367,38 @@ async def test_score_and_shortlist(run_id, agent_id):
 # ============================================================================
 
 
-async def test_record_iterations(run_id):
+async def test_record_iterations(run_id, agent_id):
     """Test recording and retrieving ReAct iterations."""
-    from oculai_mcp.db import tasks, iterations
+    from oculai_mcp.db import iterations, tasks
 
-    # Get tasks for this run by listing plans
-    plans = await tasks.get_plan(run_id)  # May fail — try alternate approach
-    if plans is None:
-        # Fallback: create a standalone iteration test
-        from oculai_mcp.db.client import execute_with_retry
-
-        # Direct SQL to get a task_id
-        import asyncpg
-        try:
-            conn = None  # Will use pool
-        except Exception:
-            pass
-        pytest.skip("No tasks available for iteration test")
-        return
-
-    # If we have a plan, get its tasks
-    all_tasks = await tasks.get_task_depths(run_id)
-    if not all_tasks:
-        pytest.skip("No tasks available for iteration test")
-        return
-
-    task_id = all_tasks[0]["task_id"] if isinstance(all_tasks[0], dict) else all_tasks[0]
+    # Own the setup instead of depending on execution order or another test's
+    # active plan. The previous skip also passed run_id to two plan_id APIs.
+    plan_id = await tasks.create_plan(
+        run_id=run_id,
+        planner_state_json={"strategy": "iteration persistence test", "tasks": []},
+        strategy_summary="Iteration persistence test",
+        created_by_agent=agent_id,
+    )
+    task_id = await tasks.create_task(
+        plan_id=plan_id,
+        run_id=run_id,
+        task_type="quality_check",
+        task_name="Record ReAct iteration history",
+        input_data={"purpose": "e2e iteration test"},
+        step_key="record_iteration_test",
+        created_by_agent=agent_id,
+    )
 
     # Record iterations
-    for i, (itype, reasoning) in enumerate([
-        ("think", "Testing search hypothesis for LLM inference engineers"),
-        ("search", None),
-        ("observe", "Found 15 candidates with high signal quality"),
-        ("stop", "Quality threshold met, stopping search"),
-    ], 1):
+    for i, (itype, reasoning) in enumerate(
+        [
+            ("think", "Testing search hypothesis for LLM inference engineers"),
+            ("search", None),
+            ("observe", "Found 15 candidates with high signal quality"),
+            ("stop", "Quality threshold met, stopping search"),
+        ],
+        1,
+    ):
         iter_id = await iterations.record_iteration(
             task_id=task_id,
             iteration_number=i,
@@ -436,18 +471,43 @@ async def test_review_orchestrator(run_id):
 # ============================================================================
 
 
-async def test_export_report(run_id):
+async def test_export_report(run_id, agent_id):
     """Test report generation — verify module is importable."""
     from oculai_mcp.tools import report
+    from oculai_mcp.tools.outreach import (
+        check_approval_status,
+        decide_human_approval,
+        request_human_approval,
+    )
 
     assert hasattr(report, "export_report"), "export_report should exist"
 
     # Try export — may fail on schema mismatch
-    try:
-        result = await report.export_report(run_id=run_id, format="html")
-        assert result is not None, "export_report should return a result"
-    except Exception as e:
-        print(f"\n  [KNOWN ISSUE] Report export: {e}")
+    request = await request_human_approval(
+        run_id=run_id,
+        action_type="export_report",
+        action_context={"format": "html"},
+        agent_id=agent_id,
+    )
+    approval_id = UUID(request["approval_id"])
+    decision = await decide_human_approval(
+        approval_id=approval_id,
+        decision="approve",
+        reviewer_id="e2e-human-reviewer@example.com",
+        reviewer_role="privacy_officer",
+        review_notes="E2E approval for an internal test report.",
+    )
+    assert decision["status"] == "approved"
+
+    result = await report.export_report(
+        run_id=run_id,
+        format="html",
+        approval_id=approval_id,
+    )
+    assert result is not None, "export_report should return a result"
+    assert result["approval_audit"]["reviewed_by"] == "e2e-human-reviewer@example.com"
+    status = await check_approval_status(approval_id)
+    assert status["consumed"] is True
 
 
 # ============================================================================
@@ -458,8 +518,16 @@ async def test_export_report(run_id):
 async def test_error_classes():
     """Test OculaiError hierarchy independently of DB."""
     from oculai_mcp.tools.errors import (
-        OculaiError, ValidationError, NotFoundError, ConflictError,
-        SourceError, QuotaError, AuthError, InternalError, ok, err,
+        AuthError,
+        ConflictError,
+        InternalError,
+        NotFoundError,
+        OculaiError,
+        QuotaError,
+        SourceError,
+        ValidationError,
+        err,
+        ok,
     )
 
     # Test each error class
@@ -492,7 +560,15 @@ async def test_error_classes():
     assert error["error"]["details"]["retry_after"] == 60
 
     # Test that OculaiError is the base class
-    for cls in [ValidationError, NotFoundError, ConflictError, SourceError, QuotaError, AuthError, InternalError]:
+    for cls in [
+        ValidationError,
+        NotFoundError,
+        ConflictError,
+        SourceError,
+        QuotaError,
+        AuthError,
+        InternalError,
+    ]:
         assert issubclass(cls, OculaiError), f"{cls.__name__} should be subclass of OculaiError"
 
 
@@ -502,34 +578,55 @@ async def test_error_classes():
 
 
 async def test_tool_registry():
-    """Test that TOOL_REGISTRY has all 42 tools with callable handlers."""
-    from oculai_mcp.tool_registry import TOOL_REGISTRY, get_tool, list_tools
+    """Test that TOOL_REGISTRY has all 43 tools with callable handlers."""
+    from oculai_mcp.tool_registry import get_tool, list_tools
 
     tools = list_tools()
-    assert len(tools) == 42, f"Expected 42 tools, got {len(tools)}"
+    assert len(tools) == 43, f"Expected 43 tools, got {len(tools)}"
 
     # Spot-check key tools across all categories
     key_tools = [
-        "oculai_create_run", "oculai_get_run_state", "oculai_checkpoint_plan",
-        "oculai_claim_tasks", "oculai_complete_task", "oculai_fail_task",
-        "oculai_record_iteration", "oculai_get_task_iterations",
-        "oculai_broadcast_discovery", "oculai_get_broadcasts",
-        "oculai_list_source_capabilities", "oculai_search_source",
-        "oculai_deep_search", "oculai_get_search_progress",
-        "oculai_firecrawl_scrape", "oculai_crawl_site",
+        "oculai_create_run",
+        "oculai_get_run_state",
+        "oculai_checkpoint_plan",
+        "oculai_claim_tasks",
+        "oculai_complete_task",
+        "oculai_fail_task",
+        "oculai_record_iteration",
+        "oculai_get_task_iterations",
+        "oculai_broadcast_discovery",
+        "oculai_get_broadcasts",
+        "oculai_list_source_capabilities",
+        "oculai_search_source",
+        "oculai_deep_search",
+        "oculai_get_search_progress",
+        "oculai_firecrawl_scrape",
+        "oculai_crawl_site",
         "oculai_fetch_source_detail",
-        "oculai_upsert_candidate", "oculai_upsert_candidates_batch",
-        "oculai_link_identity", "oculai_list_candidates", "oculai_get_candidate",
-        "oculai_attach_evidence", "oculai_get_evidence", "oculai_get_evidence_by_tier",
-        "oculai_score_candidate", "oculai_record_assessment",
-        "oculai_get_shortlist", "oculai_get_score_history",
-        "oculai_create_review_session", "oculai_execute_review_pass",
-        "oculai_get_review_progress", "oculai_apply_audit_adjustments",
+        "oculai_upsert_candidate",
+        "oculai_upsert_candidates_batch",
+        "oculai_link_identity",
+        "oculai_list_candidates",
+        "oculai_get_candidate",
+        "oculai_attach_evidence",
+        "oculai_get_evidence",
+        "oculai_get_evidence_by_tier",
+        "oculai_score_candidate",
+        "oculai_record_assessment",
+        "oculai_get_shortlist",
+        "oculai_get_score_history",
+        "oculai_create_review_session",
+        "oculai_execute_review_pass",
+        "oculai_get_review_progress",
+        "oculai_apply_audit_adjustments",
         "oculai_finalize_review_session",
         "oculai_export_report",
         "oculai_search_web",
-        "oculai_create_outreach_draft", "oculai_request_human_approval",
-        "oculai_check_approval_status", "oculai_list_pending_approvals",
+        "oculai_create_outreach_draft",
+        "oculai_request_human_approval",
+        "oculai_decide_human_approval",
+        "oculai_check_approval_status",
+        "oculai_list_pending_approvals",
         "oculai_get_outreach_history",
         "oculai_capture_page_evidence",
     ]
@@ -540,7 +637,7 @@ async def test_tool_registry():
         assert callable(handler), f"Handler for {name} should be callable"
 
     # Verify counts by category
-    assert len(tools) == 42, "Should have exactly 42 tools"
+    assert len(tools) == 43, "Should have exactly 43 tools"
 
 
 # ============================================================================
@@ -551,7 +648,8 @@ async def test_tool_registry():
 async def test_tool_error_handler_decorator():
     """Test the @tool_error_handler decorator works correctly."""
     from oculai_mcp.tools.errors import (
-        tool_error_handler, ValidationError, NotFoundError, InternalError,
+        ValidationError,
+        tool_error_handler,
     )
 
     # Test success wrapping

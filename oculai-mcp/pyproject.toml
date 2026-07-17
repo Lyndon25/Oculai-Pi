@@ -21,6 +21,7 @@ duckduckgo = ["duckduckgo-search>=7.0"]
 
 # Development
 dev = ["pytest>=8.0", "pytest-asyncio>=0.24", "anyio>=4.0", "ruff>=0.5", "mypy>=1.10"]
+packaging = ["pyinstaller==6.15.0"]
 
 [build-system]
 requires = ["hatchling"]
@@ -53,9 +54,6 @@ ignore = [
     "E722",  # bare except (common in error-handling code)
     "E741",  # ambiguous variable name (l, I, O)
 ]
-
-[tool.ruff.lint.per-file-ignores]
-"tests/*" = ["E", "W", "I"]  # tests: enforce only pyflakes (F)
 
 [tool.mypy]
 python_version = "3.11"

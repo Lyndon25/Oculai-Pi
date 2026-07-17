@@ -32,24 +32,24 @@ TIER_RULES: dict[str, dict[str, int]] = {
         "topic": 3,
     },
     "baidu_qianfan": {
-        "profile_page": 1,
+        "profile_page": 2,
         "article": 2,
         "web_page": 3,
     },
     "zhihu": {
-        "profile": 1,
+        "profile": 2,
         "answer": 2,
         "article": 2,
         "blog_post": 2,
     },
     "juejin": {
-        "profile": 1,
+        "profile": 2,
         "article": 2,
         "blog_post": 2,
         "comment": 3,
     },
     "csdn": {
-        "profile": 1,
+        "profile": 2,
         "blog_post": 2,
         "blog": 2,
         "comment": 3,
@@ -94,8 +94,10 @@ TIER_RULES: dict[str, dict[str, int]] = {
 
 def get_tier(source_name: str, evidence_type: str) -> int:
     """Get the quality tier for a given source and evidence type."""
-    source_rules = TIER_RULES.get(source_name, {})
-    return source_rules.get(evidence_type, 0)
+    source_key = source_name.strip().lower().replace("-", "_").replace(" ", "_")
+    type_key = evidence_type.strip().lower().replace("-", "_").replace(" ", "_")
+    source_rules = TIER_RULES.get(source_key, {})
+    return source_rules.get(type_key, 0)
 
 
 def _detect_quality_flags(source_name: str, content: dict[str, Any]) -> list[str]:
