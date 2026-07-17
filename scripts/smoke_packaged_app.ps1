@@ -199,5 +199,9 @@ try {
         Remove-Item -LiteralPath $CaseRoot -Recurse -Force
     } elseif (-not $Succeeded) {
         Write-Warning "Packaged app smoke logs preserved at $CaseRoot"
+        foreach ($Log in (Get-ChildItem -LiteralPath $CaseRoot -Filter "*.log" -File -ErrorAction SilentlyContinue)) {
+            Write-Host "--- $($Log.Name) ---"
+            Get-Content -LiteralPath $Log.FullName -Tail 200
+        }
     }
 }
