@@ -401,6 +401,7 @@ export class PostgresManager {
             ...this.postgresEnv(),
             PGPASSWORD: this.config.password,
             PGCLIENTENCODING: "UTF8",
+            PGOPTIONS: "-c client_encoding=UTF8",
           },
         }
       );
@@ -444,6 +445,7 @@ export class PostgresManager {
             ...this.postgresEnv(),
             PGPASSWORD: this.config.password,
             PGCLIENTENCODING: "UTF8",
+            PGOPTIONS: "-c client_encoding=UTF8",
           },
         }
       );
