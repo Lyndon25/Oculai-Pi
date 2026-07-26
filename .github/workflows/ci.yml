@@ -82,10 +82,12 @@ jobs:
           cd oculai-desktop
           npm ci
       - name: Audit dependencies
+        # Filtered gate: allowlists only advisories pinned inside the
+        # pi-coding-agent npm-shrinkwrap (unfixable downstream) — see
+        # oculai-desktop/scripts/check-audit.mjs.
         run: |
           cd oculai-desktop
-          npm audit --omit=dev --audit-level=moderate
-          npm audit --audit-level=moderate
+          npm run audit:ci
       - name: Typecheck
         run: |
           cd oculai-desktop
