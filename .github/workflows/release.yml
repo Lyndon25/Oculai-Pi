@@ -16,18 +16,18 @@ jobs:
 
     steps:
       - name: Checkout (with LFS)
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           lfs: true
           fetch-depth: 0
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: "24"
 
       - name: Setup Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: "3.12"
 
@@ -120,7 +120,7 @@ jobs:
 
       - name: Upload packaged smoke diagnostics
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: packaged-app-smoke-${{ github.run_id }}
           path: work/packaged-app-smoke
@@ -146,7 +146,7 @@ jobs:
 
       - name: Upload installer artifact (fallback)
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: oculai-installer-${{ github.run_id }}
           path: |
