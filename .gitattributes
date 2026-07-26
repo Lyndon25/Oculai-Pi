@@ -1,3 +1,8 @@
 # Git LFS — track the large Pi runtime binary (~121MB).
 # All other pi-windows-x64/ companion files are small (<2MB) and use regular git objects.
 pi-windows-x64/pi.exe filter=lfs merge=lfs -text
+
+# SQL schema files are byte-compared between oculai-db/schema and the desktop
+# mirror (scripts/sync_db_schema.py --check); force LF so Windows working
+# trees can't drift from the committed LF blobs via autocrlf.
+*.sql text eol=lf
