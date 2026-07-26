@@ -45,17 +45,18 @@ services:
     volumes:
       - ./scripts:/scripts:ro
       - ./schema/migrations:/migrations:ro
+    # YAML folded scalar: keep every continuation line at the same indent —
+    # deeper-indented lines keep literal newlines, which splits the sh -c
+    # body into separate commands and drops all arguments.
     command: >
-      sh -c "
-        pip install -q asyncpg &&
-        python /scripts/run_migrations.py
-          --host $${DB_HOST}
-          --port $${DB_PORT}
-          --user $${DB_USER}
-          --password $${DB_PASSWORD}
-          --dbname $${DB_NAME}
-          --migrations-dir /migrations
-      "
+      sh -c "pip install -q asyncpg &&
+      python /scripts/run_migrations.py
+      --host $${DB_HOST}
+      --port $${DB_PORT}
+      --user $${DB_USER}
+      --password $${DB_PASSWORD}
+      --dbname $${DB_NAME}
+      --migrations-dir /migrations"
     networks:
       - oculai-net
     restart: "no"
